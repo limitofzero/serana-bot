@@ -109,6 +109,17 @@ pub trait LlmProvider: Send + Sync {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError>;
 }
 
+#[async_trait]
+impl<T: LlmProvider + ?Sized> LlmProvider for Arc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        (**self).complete(request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

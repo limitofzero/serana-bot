@@ -4,21 +4,30 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "serana_tg"
+path = "src/lib.rs"
+
 [[bin]]
 name = "serana-tg"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 dotenvy = "0.15.7"
+jiff = "0.2.37"
 serana-adapters = { version = "0.1.0", path = "../serana-adapters" }
 serana-domain = { version = "0.1.0", path = "../serana-domain" }
 serana-services = { version = "0.1.0", path = "../serana-services" }
-teloxide = "0.17.0"
+teloxide = { version = "0.17.0", features = ["macros"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+jiff = "0.2.37"
 serana-testkit = { path = "../serana-testkit" }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
 wiremock = "0.6.5"

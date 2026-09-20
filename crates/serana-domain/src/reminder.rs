@@ -6,6 +6,8 @@
 //! here: a stored `0 10 20 * *` has to be translated back into words before it can be
 //! shown to the user, whereas a [`Recurrence`] renders itself.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -295,6 +297,36 @@ pub enum NotifyError {
 
     #[error("delivery failed: {0}")]
     Transport(String),
+}
+
+#[async_trait]
+impl<T: ReminderRepository + ?Sized> ReminderRepository for Arc<T> {
+    async fn get(&self, id: &ReminderId) -> Result<Option<Reminder>, StorageError> {
+        (**self).get(id).await
+    }
+
+    async fn put(&self, reminder: &Reminder) -> Result<(), StorageError> {
+        (**self).put(reminder).await
+    }
+
+    async fn delete(&self, id: &ReminderId) -> Result<(), StorageError> {
+        (**self).delete(id).await
+    }
+
+    async fn list_for_owner(&self, owner: UserId) -> Result<Vec<Reminder>, StorageError> {
+        (**self).list_for_owner(owner).await
+    }
+
+    async fn due_at(&self, now: jiff::Timestamp) -> Result<Vec<Reminder>, StorageError> {
+        (**self).due_at(now).await
+    }
+}
+
+#[async_trait]
+impl<T: Notifier + ?Sized> Notifier for Arc<T> {
+    async fn notify(&self, owner: UserId, text: &str) -> Result<(), NotifyError> {
+        (**self).notify(owner, text).await
+    }
 }
 
 #[cfg(test)]

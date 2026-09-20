@@ -4,6 +4,24 @@ A personal AI agent in Rust. An OpenAI-compatible model wrapped in a harness —
 management, tools, memory, subagents, skills, scheduling — reachable from a terminal REPL
 or from Telegram.
 
+## What it does today
+
+Reminders, set in plain language over Telegram:
+
+```
+/reminder каждый месяц 20 число - писать мне что надо оформить invoice
+/reminders
+/reminder_delete a3f9k2xy
+```
+
+A model reads the request into a schedule; the schedule is stored and read back to you in
+words, not as a cron expression. A scheduler ticks beside the bot and delivers each reminder
+when it comes round. Downtime collapses missed firings into one message rather than replaying
+them.
+
+The bot answers only the Telegram user ids in `SERANA_ALLOWED_USER_IDS`, and an empty list
+means nobody.
+
 ## Run it
 
 ```bash
