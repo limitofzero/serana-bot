@@ -1,0 +1,18 @@
+[package]
+name = "serana-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+serana-domain = { version = "0.1.0", path = "../serana-domain" }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+serana-testkit = { path = "../serana-testkit" }
+rstest = "0.27.0"
+tokio-test = "0.4.5"

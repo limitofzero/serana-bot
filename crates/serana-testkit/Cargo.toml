@@ -1,0 +1,11 @@
+[package]
+name = "serana-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+serana-domain = { version = "0.1.0", path = "../serana-domain" }
+serde_json = "1.0.151"
+tokio = "1.53.1"

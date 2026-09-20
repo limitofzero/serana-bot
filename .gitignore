@@ -1,0 +1,6 @@
+/target
+.env
+/memory
+
+.env
+recipe.json

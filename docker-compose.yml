@@ -1,0 +1,37 @@
+services:
+  # The long-running assistant. This is what you deploy.
+  serana-tg:
+    build:
+      context: .
+      target: runtime
+    image: serana:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERANA_DATA_DIR: /data
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - serana-data:/data
+    command: ["serana-tg"]
+    stop_grace_period: 30s
+
+  # Interactive REPL against the same image and the same state.
+  # Not started by `up`: run it with `docker compose run --rm serana`.
+  serana:
+    build:
+      context: .
+      target: runtime
+    image: serana:latest
+    profiles: ["cli"]
+    env_file: .env
+    environment:
+      SERANA_DATA_DIR: /data
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - serana-data:/data
+    command: ["serana"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  serana-data:

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/serana-domain",
+    "crates/serana-services",
+    "crates/serana-adapters",
+    "crates/serana-testkit",
+    "crates/serana-cli",
+    "crates/serana-tg",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+serana-domain = { path = "crates/serana-domain" }
+serana-services = { path = "crates/serana-services" }
+serana-adapters = { path = "crates/serana-adapters" }
+serana-testkit = { path = "crates/serana-testkit" }
