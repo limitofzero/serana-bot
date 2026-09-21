@@ -75,14 +75,22 @@ than by discipline.
 crates/
 ├── serana-domain/     Types and port traits. Pure. No I/O, no HTTP, no filesystem.
 ├── serana-services/   Orchestration and business logic. Depends on domain ONLY.
-├── serana-adapters/   Concrete port impls (OpenAI client, FS repos). Depends on domain ONLY.
+├── serana-adapters/   Concrete port impls (OpenAI client, SQLite repos). Depends on domain ONLY.
+├── serana-app/        Shared application layer: command surface, replies, config, wiring.
 ├── serana-testkit/    In-memory fakes and fixtures. dev-dependency only.
-├── serana-cli/        Composition root #1 — wires adapters into services.
-└── serana-tg/         Composition root #2 — same wiring, Telegram delivery.
+├── serana-cli/        Composition root #1 — terminal REPL.
+└── serana-tg/         Composition root #2 — Telegram bot.
 ```
 
 **The dependency rule, in one line:** `services` and `adapters` both point at `domain`, never
-at each other; only the binaries know about both.
+at each other; `serana-app` sits above both; only the binaries sit above `serana-app`.
+
+`serana-app` exists because there are two frontends. Anything both of them need — a command,
+a sentence the user reads, an environment variable, a line of graph construction — belongs
+there, not in whichever binary happened to need it first. A frontend importing another
+frontend is the failure this prevents. What stays in a binary is only what cannot exist
+without its transport: teloxide's command derive, the Telegram notifier, the REPL's line
+parser.
 
 - `serana-domain` — `Message`, `ToolCall`, `Conversation`, `AgentError`, and the port traits:
   `LlmProvider`, `ConversationRepository`, `MemoryRepository`, `Tool`, `Clock`. A port trait
@@ -92,8 +100,11 @@ at each other; only the binaries know about both.
   must be constructible with a fake. A service that constructs its own HTTP client is a bug.
 - `serana-adapters` — `OpenAiProvider`, `FsConversationRepository`, `SystemClock`. One adapter
   per module. Adapters translate wire formats to domain types and own all I/O.
-- `serana-cli` / `serana-tg` — the only places that call `::new()` on concrete adapters, read
-  env vars, and build the object graph. Keep them thin; logic here means it is untestable.
+- `serana-app` — `Command`, `respond`, every user-facing string, `AppConfig`, and the
+  functions that build the object graph. Depends on domain, services and adapters. Contains
+  no transport.
+- `serana-cli` / `serana-tg` — thin. They translate their transport into a `Command`, call
+  `respond`, and send the result back. Logic here is logic that cannot be tested.
 
 ### Module hygiene
 
@@ -142,6 +153,12 @@ Every module carries its own unit tests; e2e covers the paths a user actually wa
 - Public items get doc comments. Ports get doc comments explaining the contract an
   implementor must honour.
 - Code, comments, doc comments and commit messages are in English.
+- **Everything the user reads is in English too**, and it all lives in `serana-app/src/text.rs`
+  so it can be found and changed in one place. The user may write in any language: their words
+  are echoed back untouched — a reminder's text is stored and redisplayed exactly as typed,
+  never translated or transliterated — and the extraction prompt tells the model to keep it
+  that way. Tests keep non-Latin fixtures for precisely this reason; assertions on *our* copy
+  are English, assertions on *their* words are not.
 
 ## 5. Packaging
 

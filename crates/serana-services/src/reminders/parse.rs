@@ -1,4 +1,5 @@
-//! Turning "каждый месяц 20 число" into a [`Recurrence`].
+//! Turning "every month on the 20th" — in whatever language the user wrote it — into a
+//! [`Recurrence`].
 //!
 //! The model does the language; this module does the validation. Everything here is a pure
 //! function over the model's output, so the rules are tested without a provider — which
@@ -8,7 +9,7 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use serana_domain::reminder::{Recurrence, Weekday};
+use serana_domain::reminder::{InvalidDays, MonthDays, Recurrence, WeekDays, Weekday};
 
 use super::ReminderError;
 
@@ -23,12 +24,15 @@ pub(crate) struct ParsedReminder {
     pub kind: ParsedKind,
     /// Time of day on a 24-hour clock, as `HH:MM`.
     pub time: String,
-    /// Which day of the week. Required when `kind` is `weekly`, ignored otherwise.
+    /// Which days of the week. Required when `kind` is `weekly`, ignored otherwise.
+    /// List every day the reminder should fire on.
     #[serde(default)]
-    pub weekday: Option<ParsedWeekday>,
-    /// Day of the month, 1 to 31. Required when `kind` is `monthly`, ignored otherwise.
+    pub weekdays: Option<Vec<ParsedWeekday>>,
+    /// Days of the month, each 1 to 31. Required when `kind` is `monthly`, ignored
+    /// otherwise. List every day, expanding ranges: "from the 20th to the 26th" is
+    /// [20, 21, 22, 23, 24, 25, 26].
     #[serde(default)]
-    pub day_of_month: Option<i8>,
+    pub days_of_month: Option<Vec<i8>>,
     /// Calendar date as `YYYY-MM-DD`. Required when `kind` is `once`, ignored otherwise.
     #[serde(default)]
     pub date: Option<String>,
@@ -83,24 +87,26 @@ impl ParsedReminder {
         let recurrence = match self.kind {
             ParsedKind::Daily => Recurrence::Daily { at: time },
             ParsedKind::Weekly => {
-                let weekday = self.weekday.ok_or_else(|| {
-                    ReminderError::Unparsable("a weekly reminder needs a weekday".into())
-                })?;
-                Recurrence::Weekly {
-                    weekday: weekday.into(),
-                    at: time,
-                }
+                let weekdays = self.weekdays.unwrap_or_default();
+                let days =
+                    WeekDays::new(weekdays.into_iter().map(Weekday::from)).map_err(|_| {
+                        ReminderError::Unparsable("a weekly reminder needs a weekday".into())
+                    })?;
+                Recurrence::Weekly { days, at: time }
             }
             ParsedKind::Monthly => {
-                let day = self.day_of_month.ok_or_else(|| {
-                    ReminderError::Unparsable("a monthly reminder needs a day of the month".into())
+                let days_of_month = self.days_of_month.unwrap_or_default();
+                // `MonthDays` owns the range check, so a hallucinated day 45 is refused in
+                // one place rather than wherever someone remembered to look.
+                let days = MonthDays::new(days_of_month).map_err(|error| match error {
+                    InvalidDays::Empty => ReminderError::Unparsable(
+                        "a monthly reminder needs a day of the month".into(),
+                    ),
+                    InvalidDays::OutOfRange(day) => {
+                        ReminderError::Unparsable(format!("{day} is not a day of the month"))
+                    }
                 })?;
-                if !(1..=31).contains(&day) {
-                    return Err(ReminderError::Unparsable(format!(
-                        "{day} is not a day of the month"
-                    )));
-                }
-                Recurrence::Monthly { day, at: time }
+                Recurrence::Monthly { days, at: time }
             }
             ParsedKind::Once => {
                 let raw = self.date.ok_or_else(|| {
@@ -157,8 +163,8 @@ mod tests {
         ParsedReminder {
             kind,
             time: "10:00".into(),
-            weekday: None,
-            day_of_month: None,
+            weekdays: None,
+            days_of_month: None,
             date: None,
             text: "оформить invoice".into(),
         }
@@ -167,12 +173,12 @@ mod tests {
     #[test]
     fn the_brief_example_becomes_a_monthly_recurrence() {
         let mut p = parsed(ParsedKind::Monthly);
-        p.day_of_month = Some(20);
+        p.days_of_month = Some(vec![20]);
         let (recurrence, text) = p.into_recurrence().unwrap();
         assert_eq!(
             recurrence,
             Recurrence::Monthly {
-                day: 20,
+                days: MonthDays::new([20]).unwrap(),
                 at: time(10, 0, 0, 0)
             }
         );
@@ -193,12 +199,12 @@ mod tests {
     #[test]
     fn a_weekly_reminder_carries_its_weekday() {
         let mut p = parsed(ParsedKind::Weekly);
-        p.weekday = Some(ParsedWeekday::Friday);
+        p.weekdays = Some(vec![ParsedWeekday::Friday]);
         let (recurrence, _) = p.into_recurrence().unwrap();
         assert_eq!(
             recurrence,
             Recurrence::Weekly {
-                weekday: Weekday::Friday,
+                days: WeekDays::new([Weekday::Friday]).unwrap(),
                 at: time(10, 0, 0, 0)
             }
         );
@@ -239,7 +245,7 @@ mod tests {
     fn an_impossible_day_of_the_month_is_refused() {
         for day in [0, 32, -1, 99] {
             let mut p = parsed(ParsedKind::Monthly);
-            p.day_of_month = Some(day);
+            p.days_of_month = Some(vec![day]);
             assert!(p.into_recurrence().is_err(), "{day} should be refused");
         }
     }
@@ -248,7 +254,7 @@ mod tests {
     fn valid_days_of_the_month_are_accepted_at_the_boundaries() {
         for day in [1, 28, 31] {
             let mut p = parsed(ParsedKind::Monthly);
-            p.day_of_month = Some(day);
+            p.days_of_month = Some(vec![day]);
             assert!(p.into_recurrence().is_ok(), "{day} should be accepted");
         }
     }
@@ -310,8 +316,8 @@ mod tests {
     fn fields_irrelevant_to_the_kind_are_ignored_rather_than_rejected() {
         // Models volunteer extra fields; that is not a reason to refuse the reminder.
         let mut p = parsed(ParsedKind::Daily);
-        p.weekday = Some(ParsedWeekday::Friday);
-        p.day_of_month = Some(20);
+        p.weekdays = Some(vec![ParsedWeekday::Friday]);
+        p.days_of_month = Some(vec![20]);
         p.date = Some("2026-03-20".into());
         assert_eq!(
             p.into_recurrence().unwrap().0,

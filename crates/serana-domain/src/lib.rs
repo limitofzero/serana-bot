@@ -33,8 +33,8 @@ pub use memory::{
 };
 pub use message::{Message, ToolCall, ToolCallId, Usage};
 pub use reminder::{
-    Notifier, NotifyError, Recurrence, Reminder, ReminderId, ReminderRepository, TimeZoneName,
-    UserId, Weekday,
+    InvalidDays, MonthDays, Notifier, NotifyError, Recurrence, Reminder, ReminderId,
+    ReminderRepository, TimeZoneName, UserId, WeekDays, Weekday,
 };
 pub use retrieval::{Embedding, EmbeddingProvider, Passage, Retriever};
 pub use tool::{Tool, ToolRegistry, ToolSpec};

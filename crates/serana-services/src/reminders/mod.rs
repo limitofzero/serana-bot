@@ -1,23 +1,35 @@
 //! Creating, listing and cancelling reminders.
 
 mod parse;
+mod prompt;
 mod scheduler;
+mod tools;
 
 use std::sync::Arc;
 
 use serana_domain::llm::{CompletionRequest, LlmProvider};
 use serana_domain::message::Message;
-use serana_domain::reminder::{Reminder, ReminderId, ReminderRepository, TimeZoneName, UserId};
-use serana_domain::tool::ToolSpec;
+use serana_domain::reminder::{
+    Recurrence, Reminder, ReminderId, ReminderRepository, TimeZoneName, UserId,
+};
 use serana_domain::{Clock, IdGenerator, LlmError, StorageError};
 
 use parse::ParsedReminder;
 
 pub use scheduler::{SchedulerService, TickReport};
 
-/// The function the model is asked to call. Named for what it does to the user's request,
-/// not for our internals, because the name is part of the prompt the model reads.
-const PARSE_TOOL: &str = "schedule_reminder";
+/// What one reminder turn did, so the frontend can say so without re-deriving it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReminderOutcome {
+    Created(Reminder),
+    Updated(Reminder),
+    Deleted(Reminder),
+    Acknowledged(Reminder),
+    /// The model answered in prose instead of acting: a question back to the user when
+    /// several reminders matched, or an explanation of what it could not work out. Shown
+    /// verbatim, because it is the only thing that tells the user how to rephrase.
+    Said(String),
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReminderError {
@@ -48,6 +60,13 @@ pub struct ReminderConfig {
     pub model: String,
     /// Zone every new reminder is created in.
     pub default_timezone: TimeZoneName,
+    /// Sampling temperature, or `None` to let the provider use its default.
+    ///
+    /// Extraction wants determinism, so 0 is the natural choice — but reasoning models
+    /// reject any value but their default and fail the whole request with a 400. Leaving
+    /// this unset is therefore the only setting that works everywhere; models that do
+    /// honour it can be given a value.
+    pub temperature: Option<f32>,
 }
 
 /// Reminder lifecycle, independent of how the request arrived.
@@ -79,8 +98,16 @@ where
         }
     }
 
-    /// Read `request` as a schedule and store the reminder it describes.
-    pub async fn create(&self, owner: UserId, request: &str) -> Result<Reminder, ReminderError> {
+    /// Handle one "/reminder <anything>" turn: work out what the person wants and do it.
+    ///
+    /// One model call, not a loop. The person's existing reminders ride in the prompt, so
+    /// the model can resolve "the salary invoice one" without a lookup round-trip, and the
+    /// single tool call it makes is the whole turn.
+    pub async fn handle(
+        &self,
+        owner: UserId,
+        request: &str,
+    ) -> Result<ReminderOutcome, ReminderError> {
         if request.trim().is_empty() {
             return Err(ReminderError::Unparsable("the request is empty".into()));
         }
@@ -88,50 +115,112 @@ where
         let now = self.clock.now();
         let timezone = self.config.default_timezone.clone();
         let local = now.to_zoned(timezone.resolve()?);
+        let existing = self.repository.list_for_owner(owner).await?;
 
-        let response = self
-            .llm
-            .complete(
-                CompletionRequest::new(
-                    &self.config.model,
-                    Arc::from(parsing_prompt(&local, &timezone).as_str()),
-                    vec![Message::user(request)],
-                )
-                .with_tools(vec![ToolSpec::typed::<ParsedReminder>(
-                    PARSE_TOOL,
-                    "Record the schedule and text of the reminder the person asked for.",
-                )])
-                // Extraction, not creativity: the same request should yield the same
-                // schedule every time.
-                .with_temperature(0.0),
-            )
-            .await?;
+        let mut call = CompletionRequest::new(
+            &self.config.model,
+            Arc::from(prompt::build(&local, &timezone, &existing).as_str()),
+            vec![Message::user(request)],
+        )
+        .with_tools(tools::specs());
+        if let Some(temperature) = self.config.temperature {
+            call = call.with_temperature(temperature);
+        }
 
-        let call = response
+        let response = self.llm.complete(call).await?;
+
+        // A name we do not offer is a hallucination, not an action: fall through to the
+        // model's own prose rather than dispatching something we cannot check.
+        let Some(call) = response
             .tool_calls
             .into_iter()
-            .find(|call| call.name == PARSE_TOOL)
-            .ok_or_else(|| {
-                // The model answered in prose instead of calling the function. Its text is
-                // usually an explanation of why it could not, so it is worth surfacing.
-                ReminderError::Unparsable(
-                    response
-                        .content
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or("the request did not describe a schedule")
-                        .to_owned(),
-                )
-            })?;
+            .find(|call| tools::is_known(&call.name))
+        else {
+            return Ok(ReminderOutcome::Said(
+                response
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("I could not work out what you wanted there.")
+                    .to_owned(),
+            ));
+        };
 
         let arguments = call.parse_arguments().map_err(|e| {
-            ReminderError::Unparsable(format!("the schedule came back malformed: {e}"))
+            ReminderError::Unparsable(format!("the answer came back malformed: {e}"))
         })?;
-        let parsed: ParsedReminder = serde_json::from_value(arguments)
-            .map_err(|e| ReminderError::Unparsable(format!("the schedule is incomplete: {e}")))?;
-        let (recurrence, text) = parsed.into_recurrence()?;
+        self.dispatch(owner, now, &timezone, &call.name, arguments)
+            .await
+    }
 
+    /// Run the action the model chose.
+    async fn dispatch(
+        &self,
+        owner: UserId,
+        now: jiff::Timestamp,
+        timezone: &TimeZoneName,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ReminderOutcome, ReminderError> {
+        let incomplete = |e| ReminderError::Unparsable(format!("the answer was incomplete: {e}"));
+
+        match name {
+            tools::CREATE => {
+                let parsed: ParsedReminder =
+                    serde_json::from_value(arguments).map_err(incomplete)?;
+                let (recurrence, text) = parsed.into_recurrence()?;
+                Ok(ReminderOutcome::Created(
+                    self.create(owner, now, timezone.clone(), recurrence, text)
+                        .await?,
+                ))
+            }
+            tools::UPDATE => {
+                let args: tools::UpdateArgs =
+                    serde_json::from_value(arguments).map_err(incomplete)?;
+                let (recurrence, text) = args.schedule.into_recurrence()?;
+                Ok(ReminderOutcome::Updated(
+                    self.update(
+                        owner,
+                        &ReminderId::new(args.id.trim()),
+                        recurrence,
+                        text,
+                        now,
+                    )
+                    .await?,
+                ))
+            }
+            tools::DELETE => {
+                let args: tools::TargetArgs =
+                    serde_json::from_value(arguments).map_err(incomplete)?;
+                Ok(ReminderOutcome::Deleted(
+                    self.delete(owner, &ReminderId::new(args.id.trim())).await?,
+                ))
+            }
+            tools::ACKNOWLEDGE => {
+                let args: tools::TargetArgs =
+                    serde_json::from_value(arguments).map_err(incomplete)?;
+                Ok(ReminderOutcome::Acknowledged(
+                    self.acknowledge(owner, &ReminderId::new(args.id.trim()))
+                        .await?,
+                ))
+            }
+            // `is_known` gates the caller, so reaching here means the two lists disagree.
+            other => Err(ReminderError::Unparsable(format!(
+                "I do not know how to {other}"
+            ))),
+        }
+    }
+
+    /// Store a new reminder from an already-validated schedule.
+    pub async fn create(
+        &self,
+        owner: UserId,
+        now: jiff::Timestamp,
+        timezone: TimeZoneName,
+        recurrence: Recurrence,
+        text: String,
+    ) -> Result<Reminder, ReminderError> {
         let mut reminder = Reminder {
             id: ReminderId::new(self.ids.generate()),
             owner,
@@ -141,6 +230,7 @@ where
             created_at: now,
             next_fire_at: None,
             last_fired_at: None,
+            acknowledged_through: None,
         };
 
         // Refuse before storing rather than after: a reminder that can never fire is
@@ -153,9 +243,63 @@ where
         Ok(reminder)
     }
 
+    /// Replace one of `owner`'s reminders' schedule and text, keeping its identity.
+    ///
+    /// `created_at` and `last_fired_at` survive because it is the same reminder. Any
+    /// outstanding acknowledgement does not: the new schedule may divide time into
+    /// different periods, and a watermark from the old one could silence days the user
+    /// has just asked for. One redundant reminder beats a silently swallowed one.
+    pub async fn update(
+        &self,
+        owner: UserId,
+        id: &ReminderId,
+        recurrence: Recurrence,
+        text: String,
+        now: jiff::Timestamp,
+    ) -> Result<Reminder, ReminderError> {
+        let mut reminder = self
+            .repository
+            .get(id)
+            .await?
+            .filter(|reminder| reminder.owner == owner)
+            .ok_or_else(|| ReminderError::NotFound(id.clone()))?;
+
+        reminder.recurrence = recurrence;
+        reminder.text = text;
+        reminder.acknowledged_through = None;
+        if reminder.reschedule(now)?.is_none() {
+            return Err(ReminderError::NeverFires);
+        }
+
+        self.repository.put(&reminder).await?;
+        Ok(reminder)
+    }
+
     /// Everything `owner` has, soonest first.
     pub async fn list(&self, owner: UserId) -> Result<Vec<Reminder>, ReminderError> {
         Ok(self.repository.list_for_owner(owner).await?)
+    }
+
+    /// Mark this period dealt with: stop firing until the next one comes round.
+    ///
+    /// The reminder is not deleted — a monthly invoice reminder acknowledged in March is
+    /// silent for the rest of March and back in April. A [`Recurrence::Once`] has no next
+    /// period, so acknowledging one retires it.
+    pub async fn acknowledge(
+        &self,
+        owner: UserId,
+        id: &ReminderId,
+    ) -> Result<Reminder, ReminderError> {
+        let mut reminder = self
+            .repository
+            .get(id)
+            .await?
+            .filter(|reminder| reminder.owner == owner)
+            .ok_or_else(|| ReminderError::NotFound(id.clone()))?;
+
+        reminder.acknowledge(self.clock.now())?;
+        self.repository.put(&reminder).await?;
+        Ok(reminder)
     }
 
     /// Cancel one of `owner`'s reminders.
@@ -175,39 +319,10 @@ where
     }
 }
 
-/// The system prompt for the extraction call.
-///
-/// It carries the current local time because "tomorrow" and "next Friday" are meaningless
-/// without it, and the model has no clock of its own.
-fn parsing_prompt(local: &jiff::Zoned, timezone: &TimeZoneName) -> String {
-    format!(
-        "You convert a person's reminder request into a schedule.\n\
-         \n\
-         Their current local date and time is {date} {time} ({weekday}), time zone {zone}.\n\
-         Resolve relative expressions such as \"tomorrow\", \"next Friday\" or \"in an hour\" \
-         against that moment.\n\
-         \n\
-         Call the `{tool}` function exactly once. Never answer in prose when the request \
-         describes a schedule.\n\
-         If the request genuinely contains no schedule, reply with one short sentence \
-         saying what is missing.\n\
-         \n\
-         Keep the reminder text in the language the person wrote it in, and keep it in their \
-         own words. Strip the scheduling part out of it: \"every month on the 20th, tell me \
-         to issue an invoice\" has the text \"issue an invoice\".\n\
-         If no time of day is given, use 09:00.",
-        date = local.date(),
-        time = local.time().strftime("%H:%M"),
-        weekday = local.strftime("%A"),
-        zone = timezone,
-        tool = PARSE_TOOL,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use serana_domain::message::ToolCall;
-    use serana_domain::reminder::{Recurrence, Weekday};
+    use serana_domain::reminder::{MonthDays, Recurrence, WeekDays, Weekday};
     use serana_testkit::{FixedClock, InMemoryReminderRepository, ScriptedLlm, SequentialIds};
 
     use super::*;
@@ -222,6 +337,7 @@ mod tests {
         ReminderConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
+            temperature: None,
         }
     }
 
@@ -241,16 +357,33 @@ mod tests {
     fn extracting(arguments: serde_json::Value) -> ScriptedLlm {
         ScriptedLlm::new().calling(vec![ToolCall::new(
             "call_1",
-            PARSE_TOOL,
+            tools::CREATE,
             arguments.to_string(),
         )])
+    }
+
+    /// Run a turn and expect it to have created a reminder.
+    async fn create(
+        service: &Service,
+        owner: UserId,
+        request: &str,
+    ) -> Result<Reminder, ReminderError> {
+        match service.handle(owner, request).await? {
+            ReminderOutcome::Created(reminder) => Ok(reminder),
+            other => panic!("expected a creation, got {other:?}"),
+        }
+    }
+
+    /// A model that calls `tool` with `arguments`.
+    fn calling(tool: &str, arguments: serde_json::Value) -> ScriptedLlm {
+        ScriptedLlm::new().calling(vec![ToolCall::new("call_1", tool, arguments.to_string())])
     }
 
     fn monthly_invoice() -> serde_json::Value {
         serde_json::json!({
             "kind": "monthly",
             "time": "10:00",
-            "day_of_month": 20,
+            "days_of_month": [20],
             "text": "оформить invoice"
         })
     }
@@ -258,18 +391,18 @@ mod tests {
     #[tokio::test]
     async fn the_request_from_the_brief_becomes_a_stored_monthly_reminder() {
         let service = service(extracting(monthly_invoice()));
-        let reminder = service
-            .create(
-                OWNER,
-                "каждый месяц 20 число - писать мне что надо оформить invoice",
-            )
-            .await
-            .unwrap();
+        let reminder = create(
+            &service,
+            OWNER,
+            "каждый месяц 20 число - писать мне что надо оформить invoice",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             reminder.recurrence,
             Recurrence::Monthly {
-                day: 20,
+                days: MonthDays::new([20]).unwrap(),
                 at: jiff::civil::time(10, 0, 0, 0)
             }
         );
@@ -287,6 +420,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_temperature_is_sent_unless_one_is_configured() {
+        // Reasoning models reject every temperature but their own default, failing the
+        // whole request with a 400 rather than clamping. Sending 0.0 for determinism made
+        // every reminder impossible to create on gpt-5.
+        let service = service(extracting(monthly_invoice()));
+        create(&service, OWNER, "every month on the 20th")
+            .await
+            .unwrap();
+        assert_eq!(service.llm.requests()[0].temperature, None);
+    }
+
+    #[tokio::test]
+    async fn a_configured_temperature_is_sent_through() {
+        let mut service = service(extracting(monthly_invoice()));
+        service.config.temperature = Some(0.0);
+        create(&service, OWNER, "every month on the 20th")
+            .await
+            .unwrap();
+        assert_eq!(service.llm.requests()[0].temperature, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn updating_keeps_the_reminders_identity_and_history() {
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
+
+        // A second turn, against a model that changes it to a week-long range at 22:30.
+        let service = Service::new(
+            service.repository,
+            calling(
+                tools::UPDATE,
+                serde_json::json!({
+                    "id": created.id.as_str(), "kind": "monthly", "time": "22:30",
+                    "days_of_month": [20, 21, 22, 23, 24, 25, 26],
+                    "text": "оформить invoice"
+                }),
+            ),
+            FixedClock::at("2026-03-10T06:00:00Z"),
+            SequentialIds::default(),
+            config(),
+        );
+        let outcome = service
+            .handle(OWNER, "make it the 20th to the 26th")
+            .await
+            .unwrap();
+        let ReminderOutcome::Updated(updated) = outcome else {
+            panic!("expected an update, got {outcome:?}");
+        };
+
+        assert_eq!(updated.id, created.id, "same reminder, not a new one");
+        assert_eq!(updated.created_at, created.created_at, "history is kept");
+        assert_eq!(
+            updated.recurrence,
+            Recurrence::Monthly {
+                days: MonthDays::new([20, 21, 22, 23, 24, 25, 26]).unwrap(),
+                at: jiff::civil::time(22, 30, 0, 0)
+            }
+        );
+        assert_eq!(
+            service.list(OWNER).await.unwrap().len(),
+            1,
+            "not duplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_clears_an_outstanding_acknowledgement() {
+        // The new schedule may divide time into different periods, so a watermark from the
+        // old one could silence days the user has just asked for.
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
+        let acked = service.acknowledge(OWNER, &created.id).await.unwrap();
+        assert!(acked.acknowledged_through.is_some());
+
+        let updated = service
+            .update(
+                OWNER,
+                &created.id,
+                Recurrence::Daily {
+                    at: jiff::civil::time(9, 0, 0, 0),
+                },
+                "оформить invoice".into(),
+                FixedClock::at("2026-03-10T06:00:00Z").now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.acknowledged_through, None);
+        assert!(updated.is_active());
+    }
+
+    #[tokio::test]
+    async fn acknowledging_silences_the_period_without_deleting_the_reminder() {
+        let service = service(extracting(serde_json::json!({
+            "kind": "monthly", "time": "22:30",
+            "days_of_month": [20, 21, 22, 23, 24, 25, 26],
+            "text": "issue the invoice"
+        })));
+        let created = create(
+            &service,
+            OWNER,
+            "every day from the 20th to the 26th at 22:30",
+        )
+        .await
+        .unwrap();
+
+        let acked = service.acknowledge(OWNER, &created.id).await.unwrap();
+        assert!(acked.acknowledged_through.is_some());
+        assert!(acked.is_active(), "it comes back, it is not deleted");
+        assert!(
+            acked.next_fire_at.unwrap() > created.next_fire_at.unwrap(),
+            "the next firing moved past the silenced days"
+        );
+        assert!(
+            service.repository.get(&created.id).await.unwrap().is_some(),
+            "still stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_someone_elses_reminder_reports_not_found() {
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "every month on the 20th")
+            .await
+            .unwrap();
+        // Same wording as a missing id, so ids cannot be probed for existence.
+        assert!(matches!(
+            service.acknowledge(OTHER, &created.id).await,
+            Err(ReminderError::NotFound(_))
+        ));
+        assert!(matches!(
+            service.acknowledge(OWNER, &ReminderId::new("nope")).await,
+            Err(ReminderError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn every_recurrence_kind_can_be_created() {
         for (arguments, expected) in [
             (
@@ -296,10 +565,10 @@ mod tests {
                 },
             ),
             (
-                serde_json::json!({"kind": "weekly", "time": "18:00", "weekday": "friday",
+                serde_json::json!({"kind": "weekly", "time": "18:00", "weekdays": ["friday"],
                                    "text": "отчёт"}),
                 Recurrence::Weekly {
-                    weekday: Weekday::Friday,
+                    days: WeekDays::new([Weekday::Friday]).unwrap(),
                     at: jiff::civil::time(18, 0, 0, 0),
                 },
             ),
@@ -312,7 +581,7 @@ mod tests {
             ),
         ] {
             let service = service(extracting(arguments));
-            let reminder = service.create(OWNER, "что-нибудь").await.unwrap();
+            let reminder = create(&service, OWNER, "что-нибудь").await.unwrap();
             assert_eq!(reminder.recurrence, expected);
             assert!(reminder.is_active());
         }
@@ -322,8 +591,7 @@ mod tests {
     async fn the_extraction_call_carries_the_current_local_time_and_offers_the_function() {
         // Without the local time in the prompt, "tomorrow" cannot be resolved at all.
         let service = service(extracting(monthly_invoice()));
-        service
-            .create(OWNER, "каждый месяц 20 число")
+        create(&service, OWNER, "каждый месяц 20 число")
             .await
             .unwrap();
 
@@ -348,13 +616,20 @@ mod tests {
             "{}",
             request.system_prompt
         );
-        assert_eq!(request.tools.len(), 1);
-        assert_eq!(request.tools[0].name, PARSE_TOOL);
+        // Every action is offered on every turn: the model picks the verb, not the user.
+        let offered: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
-            request.temperature,
-            Some(0.0),
-            "extraction must be deterministic"
+            offered,
+            vec![
+                tools::CREATE,
+                tools::UPDATE,
+                tools::DELETE,
+                tools::ACKNOWLEDGE
+            ]
         );
+        // Temperature is asserted on its own, in
+        // `no_temperature_is_sent_unless_one_is_configured`: it is a per-model capability
+        // now, not a property of extraction.
         assert_eq!(request.model, "gpt-5-mini");
     }
 
@@ -363,7 +638,7 @@ mod tests {
         let service = service(ScriptedLlm::new());
         for request in ["", "   ", "\n"] {
             assert!(matches!(
-                service.create(OWNER, request).await,
+                create(&service, OWNER, request).await,
                 Err(ReminderError::Unparsable(_))
             ));
         }
@@ -376,37 +651,36 @@ mod tests {
 
     #[tokio::test]
     async fn prose_instead_of_a_function_call_surfaces_the_models_own_explanation() {
+        // Prose is now an outcome, not a failure: it is how the model asks which of several
+        // reminders was meant, and how it says what it still needs.
         let service = service(ScriptedLlm::new().answering("I need to know what time of day."));
-        let err = service
-            .create(OWNER, "напомни про invoice")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, ReminderError::Unparsable(message)
-                     if message == "I need to know what time of day."),
-            "{err:?}"
+        let outcome = service.handle(OWNER, "напомни про invoice").await.unwrap();
+        assert_eq!(
+            outcome,
+            ReminderOutcome::Said("I need to know what time of day.".into())
         );
         assert!(service.repository.is_empty());
     }
 
     #[tokio::test]
     async fn an_empty_prose_answer_still_produces_a_usable_message() {
+        // A blank answer would otherwise reach the user as an empty message.
         let service = service(ScriptedLlm::new().answering("   "));
-        let err = service.create(OWNER, "что-то").await.unwrap_err();
-        assert!(
-            err.to_string().contains("did not describe a schedule"),
-            "{err}"
-        );
+        let outcome = service.handle(OWNER, "что-то").await.unwrap();
+        let ReminderOutcome::Said(message) = outcome else {
+            panic!("expected prose, got {outcome:?}");
+        };
+        assert!(!message.trim().is_empty(), "{message:?}");
     }
 
     #[tokio::test]
     async fn malformed_function_arguments_are_reported_not_panicked_on() {
         let service = service(ScriptedLlm::new().calling(vec![ToolCall::new(
             "c1",
-            PARSE_TOOL,
+            tools::CREATE,
             r#"{"kind":"monthly"#,
         )]));
-        let err = service.create(OWNER, "что-то").await.unwrap_err();
+        let err = create(&service, OWNER, "что-то").await.unwrap_err();
         assert!(matches!(err, ReminderError::Unparsable(_)), "{err:?}");
         assert!(service.repository.is_empty());
     }
@@ -414,7 +688,7 @@ mod tests {
     #[tokio::test]
     async fn arguments_missing_a_required_field_are_reported() {
         let service = service(extracting(serde_json::json!({"kind": "daily"})));
-        let err = service.create(OWNER, "что-то").await.unwrap_err();
+        let err = create(&service, OWNER, "что-то").await.unwrap_err();
         assert!(matches!(err, ReminderError::Unparsable(_)), "{err:?}");
     }
 
@@ -426,7 +700,7 @@ mod tests {
             "kind": "once", "time": "10:00", "date": "2020-01-01", "text": "прошлое"
         })));
         assert!(matches!(
-            service.create(OWNER, "что-то").await,
+            create(&service, OWNER, "что-то").await,
             Err(ReminderError::NeverFires)
         ));
         assert!(service.repository.is_empty());
@@ -438,7 +712,7 @@ mod tests {
         let service = service(ScriptedLlm::new().failing(LlmError::RateLimited {
             retry_after_secs: Some(30),
         }));
-        let err = service.create(OWNER, "что-то").await.unwrap_err();
+        let err = create(&service, OWNER, "что-то").await.unwrap_err();
         assert!(
             matches!(err, ReminderError::Llm(LlmError::RateLimited { .. })),
             "{err:?}"
@@ -449,11 +723,11 @@ mod tests {
     async fn a_listing_is_scoped_to_its_owner() {
         let service = service(extracting(monthly_invoice()).calling(vec![ToolCall::new(
             "c2",
-            PARSE_TOOL,
+            tools::CREATE,
             monthly_invoice().to_string(),
         )]));
-        service.create(OWNER, "мне").await.unwrap();
-        service.create(OTHER, "им").await.unwrap();
+        create(&service, OWNER, "мне").await.unwrap();
+        create(&service, OTHER, "им").await.unwrap();
 
         let mine = service.list(OWNER).await.unwrap();
         assert_eq!(mine.len(), 1);
@@ -464,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_your_own_reminder_removes_it_and_returns_it() {
         let service = service(extracting(monthly_invoice()));
-        let created = service.create(OWNER, "что-то").await.unwrap();
+        let created = create(&service, OWNER, "что-то").await.unwrap();
 
         let deleted = service.delete(OWNER, &created.id).await.unwrap();
         assert_eq!(deleted.id, created.id);
@@ -475,7 +749,7 @@ mod tests {
     async fn deleting_someone_elses_reminder_reports_not_found_and_leaves_it_alone() {
         // Not a permission error: that would confirm the id exists, and ids are guessable.
         let service = service(extracting(monthly_invoice()));
-        let created = service.create(OWNER, "что-то").await.unwrap();
+        let created = create(&service, OWNER, "что-то").await.unwrap();
 
         let err = service.delete(OTHER, &created.id).await.unwrap_err();
         assert!(matches!(err, ReminderError::NotFound(_)), "{err:?}");

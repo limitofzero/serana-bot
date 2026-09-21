@@ -164,6 +164,7 @@ mod tests {
             created_at: ts("2026-03-01T00:00:00Z"),
             next_fire_at: next_fire_at.map(ts),
             last_fired_at: None,
+            acknowledged_through: None,
         }
     }
 

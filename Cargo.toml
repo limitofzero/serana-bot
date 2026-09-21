@@ -5,6 +5,7 @@ members = [
     "crates/serana-services",
     "crates/serana-adapters",
     "crates/serana-testkit",
+    "crates/serana-app",
     "crates/serana-cli",
     "crates/serana-tg",
 ]
@@ -19,3 +20,4 @@ serana-domain = { path = "crates/serana-domain" }
 serana-services = { path = "crates/serana-services" }
 serana-adapters = { path = "crates/serana-adapters" }
 serana-testkit = { path = "crates/serana-testkit" }
+serana-app = { path = "crates/serana-app" }

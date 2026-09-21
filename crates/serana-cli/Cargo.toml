@@ -18,9 +18,13 @@ serana-services = { version = "0.1.0", path = "../serana-services" }
 reedline = "0.51.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serana-app = { version = "0.1.0", path = "../serana-app" }
 
 [dev-dependencies]
 serana-testkit = { path = "../serana-testkit" }
 rstest = "0.27.0"
 wiremock = "0.6.5"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "process"] }
+serde_json = "1.0.151"

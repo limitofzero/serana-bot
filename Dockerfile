@@ -17,7 +17,11 @@ COPY . .
 RUN cargo build --release --locked --bin serana --bin serana-tg
 
 # rustls means no OpenSSL at runtime; only the trust store is needed.
-FROM debian:bookworm-slim AS runtime
+#
+# This must stay on the same Debian release as the `rust:` builder above: the binaries link
+# the builder's glibc, and a runtime older than it fails at exec with a GLIBC_* version
+# error rather than at build time. Bump both together, never one alone.
+FROM debian:trixie-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*

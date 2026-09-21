@@ -1,0 +1,19 @@
+[package]
+name = "serana-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+jiff = "0.2.37"
+serana-adapters = { version = "0.1.0", path = "../serana-adapters" }
+serana-domain = { version = "0.1.0", path = "../serana-domain" }
+serana-services = { version = "0.1.0", path = "../serana-services" }
+tokio = { version = "1.53.1", features = ["fs"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+serana-testkit = { path = "../serana-testkit" }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

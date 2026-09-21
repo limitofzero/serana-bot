@@ -7,4 +7,6 @@
 
 pub mod reminders;
 
-pub use reminders::{ReminderConfig, ReminderError, ReminderService, SchedulerService, TickReport};
+pub use reminders::{
+    ReminderConfig, ReminderError, ReminderOutcome, ReminderService, SchedulerService, TickReport,
+};

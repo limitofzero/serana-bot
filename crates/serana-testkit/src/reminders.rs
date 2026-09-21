@@ -125,6 +125,7 @@ mod tests {
             created_at: jiff::Timestamp::UNIX_EPOCH,
             next_fire_at: next_fire_at.map(|t| t.parse().expect("valid instant")),
             last_fired_at: None,
+            acknowledged_through: None,
         }
     }
 

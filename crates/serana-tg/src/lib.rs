@@ -1,10 +1,10 @@
-//! The Telegram frontend, as a library so its command surface can be driven from
-//! integration tests.
+//! The Telegram frontend: the transport, and nothing that could live without it.
 //!
-//! `main.rs` is the composition root and holds nothing testable; everything here is
-//! reachable from `tests/`.
+//! Command semantics and every user-facing word are in `serana-ui`, shared with the CLI.
+//! What is left here is the teloxide command enum, the notifier, and configuration.
 
-pub mod commands;
+pub mod command;
 pub mod config;
 pub mod notifier;
-pub mod text;
+
+pub use command::TelegramCommand;

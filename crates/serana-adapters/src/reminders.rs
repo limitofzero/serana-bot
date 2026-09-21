@@ -86,6 +86,7 @@ fn row_to_reminder(row: &sqlx::sqlite::SqliteRow) -> Result<Reminder, StorageErr
     let recurrence: String = row.try_get("recurrence").map_err(backend)?;
     let next_fire_at: Option<i64> = row.try_get("next_fire_at").map_err(backend)?;
     let last_fired_at: Option<i64> = row.try_get("last_fired_at").map_err(backend)?;
+    let acknowledged_through: Option<i64> = row.try_get("acknowledged_through").map_err(backend)?;
 
     Ok(Reminder {
         id: ReminderId::new(row.try_get::<String, _>("id").map_err(backend)?),
@@ -98,6 +99,7 @@ fn row_to_reminder(row: &sqlx::sqlite::SqliteRow) -> Result<Reminder, StorageErr
         created_at: from_nanos(row.try_get("created_at").map_err(backend)?)?,
         next_fire_at: next_fire_at.map(from_nanos).transpose()?,
         last_fired_at: last_fired_at.map(from_nanos).transpose()?,
+        acknowledged_through: acknowledged_through.map(from_nanos).transpose()?,
     })
 }
 
@@ -129,8 +131,9 @@ impl ReminderRepository for SqliteReminderRepository {
 
         sqlx::query(
             "INSERT INTO reminders
-                 (id, owner, text, recurrence, timezone, created_at, next_fire_at, last_fired_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 (id, owner, text, recurrence, timezone, created_at, next_fire_at,
+                  last_fired_at, acknowledged_through)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  owner = excluded.owner,
                  text = excluded.text,
@@ -138,7 +141,8 @@ impl ReminderRepository for SqliteReminderRepository {
                  timezone = excluded.timezone,
                  created_at = excluded.created_at,
                  next_fire_at = excluded.next_fire_at,
-                 last_fired_at = excluded.last_fired_at",
+                 last_fired_at = excluded.last_fired_at,
+                 acknowledged_through = excluded.acknowledged_through",
         )
         .bind(reminder.id.as_str())
         .bind(reminder.owner.get())
@@ -148,6 +152,7 @@ impl ReminderRepository for SqliteReminderRepository {
         .bind(to_nanos(reminder.created_at)?)
         .bind(reminder.next_fire_at.map(to_nanos).transpose()?)
         .bind(reminder.last_fired_at.map(to_nanos).transpose()?)
+        .bind(reminder.acknowledged_through.map(to_nanos).transpose()?)
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -195,7 +200,7 @@ impl ReminderRepository for SqliteReminderRepository {
 
 #[cfg(test)]
 mod tests {
-    use serana_domain::reminder::Weekday;
+    use serana_domain::reminder::{MonthDays, WeekDays, Weekday};
 
     use super::*;
 
@@ -209,13 +214,14 @@ mod tests {
             owner: UserId::new(owner),
             text: format!("reminder {id}"),
             recurrence: Recurrence::Monthly {
-                day: 20,
+                days: MonthDays::new([20]).unwrap(),
                 at: jiff::civil::time(10, 0, 0, 0),
             },
             timezone: TimeZoneName::new("Asia/Tbilisi"),
             created_at: ts("2026-03-01T00:00:00Z"),
             next_fire_at: next_fire_at.map(ts),
             last_fired_at: None,
+            acknowledged_through: None,
         }
     }
 
@@ -270,11 +276,11 @@ mod tests {
                 at: jiff::civil::time(10, 0, 0, 0),
             },
             Recurrence::Weekly {
-                weekday: Weekday::Friday,
+                days: WeekDays::new([Weekday::Friday]).unwrap(),
                 at: jiff::civil::time(9, 30, 0, 0),
             },
             Recurrence::Monthly {
-                day: 31,
+                days: MonthDays::new([31]).unwrap(),
                 at: jiff::civil::time(10, 0, 0, 0),
             },
         ];

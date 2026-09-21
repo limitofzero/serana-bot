@@ -6,6 +6,7 @@
 //! here: a stored `0 10 20 * *` has to be translated back into words before it can be
 //! shown to the user, whereas a [`Recurrence`] renders itself.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -83,7 +84,10 @@ impl std::fmt::Display for TimeZoneName {
 }
 
 /// Day of the week, mirrored from jiff so it can be serialised by name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Ordered so a set of them renders and stores in calendar order rather than in whatever
+/// order the model happened to list them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Weekday {
     Monday,
@@ -109,6 +113,127 @@ impl From<Weekday> for jiff::civil::Weekday {
     }
 }
 
+impl From<jiff::civil::Weekday> for Weekday {
+    fn from(day: jiff::civil::Weekday) -> Self {
+        match day {
+            jiff::civil::Weekday::Monday => Self::Monday,
+            jiff::civil::Weekday::Tuesday => Self::Tuesday,
+            jiff::civil::Weekday::Wednesday => Self::Wednesday,
+            jiff::civil::Weekday::Thursday => Self::Thursday,
+            jiff::civil::Weekday::Friday => Self::Friday,
+            jiff::civil::Weekday::Saturday => Self::Saturday,
+            jiff::civil::Weekday::Sunday => Self::Sunday,
+        }
+    }
+}
+
+/// Why a set of days was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidDays {
+    #[error("a schedule needs at least one day")]
+    Empty,
+    #[error("{0} is not a day of the month; days run from 1 to 31")]
+    OutOfRange(i8),
+}
+
+/// A non-empty set of days of the month, each 1-31.
+///
+/// A set rather than a single day because real requests are ranges: "every day from the
+/// 20th to the 26th" is one reminder with seven firing days, not seven reminders. Stored
+/// sorted and deduplicated, so two requests that mean the same schedule compare equal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<i8>", into = "Vec<i8>")]
+pub struct MonthDays(BTreeSet<i8>);
+
+impl MonthDays {
+    pub fn new(days: impl IntoIterator<Item = i8>) -> Result<Self, InvalidDays> {
+        let days: BTreeSet<i8> = days.into_iter().collect();
+        if days.is_empty() {
+            return Err(InvalidDays::Empty);
+        }
+        if let Some(&bad) = days.iter().find(|&&day| !(1..=31).contains(&day)) {
+            return Err(InvalidDays::OutOfRange(bad));
+        }
+        Ok(Self(days))
+    }
+
+    /// Every day, ascending.
+    pub fn iter(&self) -> impl Iterator<Item = i8> + '_ {
+        self.0.iter().copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always false — the type cannot be constructed empty. Present because clippy asks for
+    /// it next to `len`, and because a caller should not have to know that.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl TryFrom<Vec<i8>> for MonthDays {
+    type Error = InvalidDays;
+
+    fn try_from(days: Vec<i8>) -> Result<Self, Self::Error> {
+        Self::new(days)
+    }
+}
+
+impl From<MonthDays> for Vec<i8> {
+    fn from(days: MonthDays) -> Self {
+        days.0.into_iter().collect()
+    }
+}
+
+/// A non-empty set of weekdays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<Weekday>", into = "Vec<Weekday>")]
+pub struct WeekDays(BTreeSet<Weekday>);
+
+impl WeekDays {
+    pub fn new(days: impl IntoIterator<Item = Weekday>) -> Result<Self, InvalidDays> {
+        let days: BTreeSet<Weekday> = days.into_iter().collect();
+        if days.is_empty() {
+            return Err(InvalidDays::Empty);
+        }
+        Ok(Self(days))
+    }
+
+    pub fn contains(&self, day: jiff::civil::Weekday) -> bool {
+        self.0.contains(&Weekday::from(day))
+    }
+
+    /// Every weekday, Monday first.
+    pub fn iter(&self) -> impl Iterator<Item = Weekday> + '_ {
+        self.0.iter().copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always false; see [`MonthDays::is_empty`].
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl TryFrom<Vec<Weekday>> for WeekDays {
+    type Error = InvalidDays;
+
+    fn try_from(days: Vec<Weekday>) -> Result<Self, Self::Error> {
+        Self::new(days)
+    }
+}
+
+impl From<WeekDays> for Vec<Weekday> {
+    fn from(days: WeekDays) -> Self {
+        days.0.into_iter().collect()
+    }
+}
+
 /// When a reminder fires.
 ///
 /// Times are wall-clock times in the reminder's own zone, not instants: "every day at
@@ -123,15 +248,17 @@ pub enum Recurrence {
     Daily {
         at: jiff::civil::Time,
     },
+    /// Fires on each listed weekday, every week.
     Weekly {
-        weekday: Weekday,
+        days: WeekDays,
         at: jiff::civil::Time,
     },
-    /// `day` is 1-31. Months without that day are **skipped**, not clamped: a reminder for
-    /// the 31st does not fire on 28 February. Clamping would fire it on a day the user did
-    /// not ask for, which is the worse failure for something like an invoice deadline.
+    /// Fires on each listed day of the month. Months without a listed day **skip** it
+    /// rather than clamping: a reminder for the 31st does not fire on 28 February.
+    /// Clamping would fire it on a day the user did not ask for, which is the worse
+    /// failure for something like an invoice deadline.
     Monthly {
-        day: i8,
+        days: MonthDays,
         at: jiff::civil::Time,
     },
 }
@@ -167,31 +294,70 @@ impl Recurrence {
                 let date = today.checked_add(jiff::Span::new().days(offset)).ok()?;
                 candidate_after(date, *at, tz, after)
             }),
-            Self::Weekly { weekday, at } => (0..=7).find_map(|offset| {
+            Self::Weekly { days, at } => (0..=7).find_map(|offset| {
                 let date = today.checked_add(jiff::Span::new().days(offset)).ok()?;
-                (date.weekday() == (*weekday).into())
+                days.contains(date.weekday())
                     .then(|| candidate_after(date, *at, tz, after))
                     .flatten()
             }),
-            Self::Monthly { day, at } => {
-                let day = *day;
-                if !(1..=31).contains(&day) {
-                    return None;
-                }
+            Self::Monthly { days, at } => {
                 let first = today.first_of_month();
                 (0..MAX_MONTHS_SEARCHED).find_map(|offset| {
                     let month = first
                         .checked_add(jiff::Span::new().months(offset as i64))
                         .ok()?;
-                    // Skip, do not clamp: the user asked for the 31st.
-                    if day > month.days_in_month() {
-                        return None;
-                    }
-                    let date = month.with().day(day).build().ok()?;
-                    candidate_after(date, *at, tz, after)
+                    // Days are ascending, so the first candidate in a month is the
+                    // earliest one. A day this month does not have is skipped, not
+                    // clamped, and the remaining days still get their chance.
+                    days.iter().find_map(|day| {
+                        if day > month.days_in_month() {
+                            return None;
+                        }
+                        let date = month.with().day(day).build().ok()?;
+                        candidate_after(date, *at, tz, after)
+                    })
                 })
             }
         }
+    }
+
+    /// The last instant of the period containing `instant`, or `None` for a recurrence
+    /// that has no next period.
+    ///
+    /// A period is the span a schedule repeats over: a day for [`Self::Daily`], a week
+    /// (Monday to Sunday) for [`Self::Weekly`], a calendar month for [`Self::Monthly`].
+    /// Acknowledging a reminder suppresses the rest of its current period and nothing
+    /// beyond it — "I have sent the invoice, stop asking until next month".
+    ///
+    /// [`Self::Once`] returns `None`: it has no next period, so acknowledging one retires
+    /// it outright.
+    pub fn period_end_after(
+        &self,
+        instant: jiff::Timestamp,
+        tz: &jiff::tz::TimeZone,
+    ) -> Option<jiff::Timestamp> {
+        let date = instant.to_zoned(tz.clone()).date();
+        let next_period_starts = match self {
+            Self::Once { .. } => return None,
+            Self::Daily { .. } => date.checked_add(jiff::Span::new().days(1)).ok()?,
+            Self::Weekly { .. } => {
+                // `to_monday_zero_offset` is 0 on Monday, so a Monday advances a full week
+                // rather than standing still.
+                let ahead = 7 - i64::from(date.weekday().to_monday_zero_offset());
+                date.checked_add(jiff::Span::new().days(ahead)).ok()?
+            }
+            Self::Monthly { .. } => date
+                .first_of_month()
+                .checked_add(jiff::Span::new().months(1))
+                .ok()?,
+        };
+        let starts = to_instant(
+            next_period_starts.to_datetime(jiff::civil::time(0, 0, 0, 0)),
+            tz,
+        )?;
+        // One nanosecond before the next period, so an occurrence falling exactly on the
+        // period boundary belongs to the new period and still fires.
+        starts.checked_sub(jiff::Span::new().nanoseconds(1)).ok()
     }
 
     /// Whether this recurrence can fire more than once.
@@ -233,19 +399,51 @@ pub struct Reminder {
     /// lookup instead of evaluating every recurrence on every tick.
     pub next_fire_at: Option<jiff::Timestamp>,
     pub last_fired_at: Option<jiff::Timestamp>,
+    /// The end of the period the user has already dealt with, if any.
+    ///
+    /// Occurrences at or before it are suppressed, which is what makes "done" mean "stop
+    /// asking until next month" rather than "delete this". It needs no clearing: once the
+    /// next period begins the watermark is in the past and stops having any effect.
+    #[serde(default)]
+    pub acknowledged_through: Option<jiff::Timestamp>,
 }
 
 impl Reminder {
     /// Recompute [`Reminder::next_fire_at`] from `now`.
     ///
-    /// Called on creation and after every delivery. Returns the new value.
+    /// Called on creation and after every delivery. Returns the new value. An outstanding
+    /// acknowledgement holds the search past the end of its period, so a delivery that
+    /// races an acknowledgement cannot resurrect the occurrences it silenced.
     pub fn reschedule(
         &mut self,
         now: jiff::Timestamp,
     ) -> Result<Option<jiff::Timestamp>, StorageError> {
         let tz = self.timezone.resolve()?;
-        self.next_fire_at = self.recurrence.next_occurrence_after(now, &tz);
+        let floor = self
+            .acknowledged_through
+            .map_or(now, |through| now.max(through));
+        self.next_fire_at = self.recurrence.next_occurrence_after(floor, &tz);
         Ok(self.next_fire_at)
+    }
+
+    /// Record that the user has dealt with this period, and skip to the next one.
+    ///
+    /// Returns the new firing time: `None` means nothing further is scheduled, which for a
+    /// [`Recurrence::Once`] is the normal outcome.
+    pub fn acknowledge(
+        &mut self,
+        now: jiff::Timestamp,
+    ) -> Result<Option<jiff::Timestamp>, StorageError> {
+        let tz = self.timezone.resolve()?;
+        self.acknowledged_through = self.recurrence.period_end_after(now, &tz);
+        match self.acknowledged_through {
+            Some(_) => self.reschedule(now),
+            // A one-off has no next period: acknowledging it is the end of it.
+            None => {
+                self.next_fire_at = None;
+                Ok(None)
+            }
+        }
     }
 
     /// Whether this reminder has a future firing time.
@@ -398,7 +596,7 @@ mod tests {
         let tz = tbilisi();
         // 2026-03-10 is a Tuesday.
         let r = Recurrence::Weekly {
-            weekday: Weekday::Friday,
+            days: WeekDays::new([Weekday::Friday]).unwrap(),
             at: time(9, 30, 0, 0),
         };
         let next = r
@@ -411,7 +609,7 @@ mod tests {
     fn a_weekly_reminder_on_today_still_fires_today_if_the_time_is_ahead() {
         let tz = tbilisi();
         let r = Recurrence::Weekly {
-            weekday: Weekday::Tuesday,
+            days: WeekDays::new([Weekday::Tuesday]).unwrap(),
             at: time(18, 0, 0, 0),
         };
         let next = r
@@ -424,7 +622,7 @@ mod tests {
     fn a_weekly_reminder_on_today_rolls_a_full_week_once_the_time_has_passed() {
         let tz = tbilisi();
         let r = Recurrence::Weekly {
-            weekday: Weekday::Tuesday,
+            days: WeekDays::new([Weekday::Tuesday]).unwrap(),
             at: time(9, 0, 0, 0),
         };
         let next = r
@@ -437,7 +635,7 @@ mod tests {
     fn the_invoice_reminder_from_the_brief_lands_on_the_twentieth() {
         let tz = tbilisi();
         let r = Recurrence::Monthly {
-            day: 20,
+            days: MonthDays::new([20]).unwrap(),
             at: time(10, 0, 0, 0),
         };
         let next = r
@@ -456,7 +654,7 @@ mod tests {
     fn a_monthly_reminder_skips_months_without_that_day_rather_than_clamping() {
         let tz = tbilisi();
         let r = Recurrence::Monthly {
-            day: 31,
+            days: MonthDays::new([31]).unwrap(),
             at: time(10, 0, 0, 0),
         };
         // From 1 February 2026: February has 28 days, so the next is 31 March.
@@ -470,7 +668,7 @@ mod tests {
     fn a_monthly_reminder_on_the_twenty_ninth_finds_a_leap_day() {
         let tz = tbilisi();
         let r = Recurrence::Monthly {
-            day: 29,
+            days: MonthDays::new([29]).unwrap(),
             at: time(8, 0, 0, 0),
         };
         // 2028 is a leap year.
@@ -481,18 +679,191 @@ mod tests {
     }
 
     #[test]
-    fn a_monthly_reminder_with_an_impossible_day_never_fires() {
-        let tz = tbilisi();
-        for day in [0, 32, -1] {
-            let r = Recurrence::Monthly {
-                day,
-                at: time(10, 0, 0, 0),
-            };
+    fn an_impossible_day_of_the_month_cannot_be_constructed() {
+        // This used to be a schedule that silently never fired. Refusing it at the
+        // constructor means a hallucinated day 45 is reported to the user instead.
+        for day in [0, 32, -1, 100] {
             assert_eq!(
-                r.next_occurrence_after(at(2026, 3, 1, 0, 0, &tz), &tz),
-                None
+                MonthDays::new([day]),
+                Err(InvalidDays::OutOfRange(day)),
+                "day {day}"
             );
         }
+        assert_eq!(MonthDays::new([]), Err(InvalidDays::Empty));
+        assert_eq!(WeekDays::new([]), Err(InvalidDays::Empty));
+    }
+
+    /// A reminder nagging daily from the 20th to the 26th, in Tbilisi.
+    fn nagging() -> Reminder {
+        Reminder {
+            id: ReminderId::new("r1"),
+            owner: UserId::new(1),
+            text: "issue the invoice".into(),
+            recurrence: Recurrence::Monthly {
+                days: MonthDays::new([20, 21, 22, 23, 24, 25, 26]).unwrap(),
+                at: time(22, 30, 0, 0),
+            },
+            timezone: TimeZoneName::new("Asia/Tbilisi"),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            next_fire_at: None,
+            last_fired_at: None,
+            acknowledged_through: None,
+        }
+    }
+
+    #[test]
+    fn acknowledging_silences_the_rest_of_the_period_and_no_further() {
+        let tz = tbilisi();
+        let mut r = nagging();
+        r.reschedule(at(2026, 3, 1, 0, 0, &tz)).unwrap();
+        assert_eq!(
+            local(r.next_fire_at.unwrap(), &tz),
+            date(2026, 3, 20).at(22, 30, 0, 0)
+        );
+
+        // The user replies "done" on the 21st, having sent the invoice.
+        let next = r.acknowledge(at(2026, 3, 21, 23, 0, &tz)).unwrap().unwrap();
+        // The 22nd through the 26th are skipped; April starts clean.
+        assert_eq!(local(next, &tz), date(2026, 4, 20).at(22, 30, 0, 0));
+    }
+
+    #[test]
+    fn an_acknowledgement_expires_with_its_period_rather_than_needing_to_be_cleared() {
+        let tz = tbilisi();
+        let mut r = nagging();
+        r.acknowledge(at(2026, 3, 21, 23, 0, &tz)).unwrap();
+        let watermark = r.acknowledged_through.unwrap();
+
+        // Once April is under way the stale watermark has no effect at all.
+        r.reschedule(at(2026, 4, 22, 0, 0, &tz)).unwrap();
+        assert!(watermark < at(2026, 4, 22, 0, 0, &tz));
+        assert_eq!(
+            local(r.next_fire_at.unwrap(), &tz),
+            date(2026, 4, 22).at(22, 30, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_delivery_racing_an_acknowledgement_cannot_revive_the_silenced_days() {
+        // The scheduler may be mid-tick when the user answers. `mark_fired` must not undo
+        // the acknowledgement by rescheduling from `now`.
+        let tz = tbilisi();
+        let mut r = nagging();
+        r.acknowledge(at(2026, 3, 21, 23, 0, &tz)).unwrap();
+        r.mark_fired(at(2026, 3, 21, 23, 1, &tz)).unwrap();
+        assert_eq!(
+            local(r.next_fire_at.unwrap(), &tz),
+            date(2026, 4, 20).at(22, 30, 0, 0),
+            "the 22nd must stay silenced"
+        );
+    }
+
+    #[test]
+    fn acknowledging_a_one_off_retires_it() {
+        let tz = tbilisi();
+        let mut r = nagging();
+        r.recurrence = Recurrence::Once {
+            at: date(2026, 3, 20).at(9, 0, 0, 0),
+        };
+        r.reschedule(at(2026, 3, 1, 0, 0, &tz)).unwrap();
+        assert!(r.is_active());
+
+        assert_eq!(r.acknowledge(at(2026, 3, 20, 9, 5, &tz)).unwrap(), None);
+        assert!(!r.is_active(), "a one-off has no next period");
+    }
+
+    #[test]
+    fn a_period_is_the_calendar_unit_the_recurrence_repeats_over() {
+        let tz = tbilisi();
+        let noon = at(2026, 3, 11, 12, 0, &tz);
+        let end = |r: &Recurrence| local(r.period_end_after(noon, &tz).unwrap(), &tz).date();
+
+        // 2026-03-11 is a Wednesday, so its week ends on Sunday the 15th.
+        assert_eq!(
+            end(&Recurrence::Daily {
+                at: time(9, 0, 0, 0)
+            }),
+            date(2026, 3, 11)
+        );
+        assert_eq!(
+            end(&Recurrence::Weekly {
+                days: WeekDays::new([Weekday::Monday]).unwrap(),
+                at: time(9, 0, 0, 0)
+            }),
+            date(2026, 3, 15)
+        );
+        assert_eq!(end(&nagging().recurrence), date(2026, 3, 31));
+        assert_eq!(
+            Recurrence::Once {
+                at: date(2026, 3, 20).at(9, 0, 0, 0)
+            }
+            .period_end_after(noon, &tz),
+            None
+        );
+    }
+
+    #[test]
+    fn days_are_sorted_and_deduplicated_so_equal_schedules_compare_equal() {
+        let scrambled = MonthDays::new([26, 20, 22, 20, 21]).unwrap();
+        assert_eq!(scrambled.iter().collect::<Vec<_>>(), vec![20, 21, 22, 26]);
+        assert_eq!(scrambled.len(), 4);
+        assert_eq!(MonthDays::new([20, 21]), MonthDays::new([21, 20, 21]));
+    }
+
+    #[test]
+    fn a_monthly_range_fires_on_every_day_of_the_range() {
+        // The request that motivated day sets: nag daily from the 20th to the 26th.
+        let tz = tbilisi();
+        let r = Recurrence::Monthly {
+            days: MonthDays::new([20, 21, 22, 23, 24, 25, 26]).unwrap(),
+            at: time(22, 30, 0, 0),
+        };
+        let mut cursor = at(2026, 3, 1, 0, 0, &tz);
+        let mut fired = Vec::new();
+        for _ in 0..9 {
+            cursor = r.next_occurrence_after(cursor, &tz).unwrap();
+            fired.push(local(cursor, &tz));
+        }
+        // Seven days this month, then it rolls into the next.
+        assert_eq!(fired[0], date(2026, 3, 20).at(22, 30, 0, 0));
+        assert_eq!(fired[6], date(2026, 3, 26).at(22, 30, 0, 0));
+        assert_eq!(fired[7], date(2026, 4, 20).at(22, 30, 0, 0));
+        assert_eq!(fired[8], date(2026, 4, 21).at(22, 30, 0, 0));
+    }
+
+    #[test]
+    fn a_month_without_a_listed_day_skips_it_and_keeps_the_others() {
+        // February has no 30th or 31st; the 28th still fires.
+        let tz = tbilisi();
+        let r = Recurrence::Monthly {
+            days: MonthDays::new([28, 30, 31]).unwrap(),
+            at: time(9, 0, 0, 0),
+        };
+        let first = r
+            .next_occurrence_after(at(2026, 2, 1, 0, 0, &tz), &tz)
+            .unwrap();
+        assert_eq!(local(first, &tz), date(2026, 2, 28).at(9, 0, 0, 0));
+        let second = r.next_occurrence_after(first, &tz).unwrap();
+        assert_eq!(local(second, &tz), date(2026, 3, 28).at(9, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_weekly_reminder_fires_on_each_listed_weekday() {
+        let tz = tbilisi();
+        let r = Recurrence::Weekly {
+            days: WeekDays::new([Weekday::Monday, Weekday::Friday]).unwrap(),
+            at: time(18, 0, 0, 0),
+        };
+        // 2026-03-09 is a Monday.
+        let mut cursor = at(2026, 3, 8, 0, 0, &tz);
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            cursor = r.next_occurrence_after(cursor, &tz).unwrap();
+            fired.push(local(cursor, &tz));
+        }
+        assert_eq!(fired[0], date(2026, 3, 9).at(18, 0, 0, 0));
+        assert_eq!(fired[1], date(2026, 3, 13).at(18, 0, 0, 0));
+        assert_eq!(fired[2], date(2026, 3, 16).at(18, 0, 0, 0));
     }
 
     #[test]
@@ -588,6 +959,7 @@ mod tests {
             created_at: jiff::Timestamp::UNIX_EPOCH,
             next_fire_at: None,
             last_fired_at: None,
+            acknowledged_through: None,
         }
     }
 
@@ -595,7 +967,7 @@ mod tests {
     fn rescheduling_fills_in_the_next_firing_time() {
         let tz = tbilisi();
         let mut r = reminder(Recurrence::Monthly {
-            day: 20,
+            days: MonthDays::new([20]).unwrap(),
             at: time(10, 0, 0, 0),
         });
         assert!(!r.is_active());
@@ -608,7 +980,7 @@ mod tests {
     fn firing_advances_the_schedule_and_records_the_delivery() {
         let tz = tbilisi();
         let mut r = reminder(Recurrence::Monthly {
-            day: 20,
+            days: MonthDays::new([20]).unwrap(),
             at: time(10, 0, 0, 0),
         });
         let fired_at = at(2026, 3, 20, 10, 0, &tz);
@@ -647,11 +1019,11 @@ mod tests {
                 at: time(10, 0, 0, 0),
             },
             Recurrence::Weekly {
-                weekday: Weekday::Friday,
+                days: WeekDays::new([Weekday::Friday]).unwrap(),
                 at: time(9, 30, 0, 0),
             },
             Recurrence::Monthly {
-                day: 20,
+                days: MonthDays::new([20]).unwrap(),
                 at: time(10, 0, 0, 0),
             },
         ] {
@@ -666,7 +1038,7 @@ mod tests {
     #[test]
     fn a_reminder_round_trips_through_serde() {
         let mut original = reminder(Recurrence::Monthly {
-            day: 20,
+            days: MonthDays::new([20]).unwrap(),
             at: time(10, 0, 0, 0),
         });
         original

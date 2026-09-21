@@ -20,7 +20,11 @@ jiff = "0.2.37"
 serana-adapters = { version = "0.1.0", path = "../serana-adapters" }
 serana-domain = { version = "0.1.0", path = "../serana-domain" }
 serana-services = { version = "0.1.0", path = "../serana-services" }
-teloxide = { version = "0.17.0", features = ["macros"] }
+serana-app = { version = "0.1.0", path = "../serana-app" }
+# teloxide defaults to native-tls, which drags openssl-sys — and therefore pkg-config
+# and libssl-dev — into the build image. rustls with the system trust store keeps the
+# runtime stage at ca-certificates alone.
+teloxide = { version = "0.17.0", default-features = false, features = ["macros", "ctrlc_handler", "rustls-native-roots"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

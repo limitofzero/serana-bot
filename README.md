@@ -35,6 +35,10 @@ The REPL, against the same state:
 docker compose run --rm serana
 ```
 
+It manages reminders and does not deliver them — a second scheduler over the same
+database would send everything twice. Set `SERANA_USER_ID` to your Telegram id and the
+bot delivers what you create there.
+
 State (conversations, memory, any future index) lives in the `serana-data` volume, mounted
 at `/data`.
 
@@ -56,9 +60,16 @@ and `adapters` both point at `domain` and never at each other; only the binaries
 | `serana-domain` | Types and port traits. Pure — no I/O. |
 | `serana-services` | The turn loop and orchestration. |
 | `serana-adapters` | Provider client, repositories — everything that talks to the world. |
+| `serana-app` | Shared by both frontends: commands, replies, config, wiring. |
 | `serana-testkit` | In-memory fakes for tests. |
-| `serana-cli` | Terminal REPL. |
+| `serana-cli` | Terminal REPL. Manages reminders; does not deliver them. |
 | `serana-tg` | Telegram bot. |
 
-Conventions live in `.claude/skills/serana/SKILL.md`. Notes taken from the Python reference
-implementation are in `docs/reference-notes.md`.
+## Reading
+
+| File | What it is |
+| --- | --- |
+| `docs/concept.md` | What serana is trying to be: the `LLM + harness` model this project follows, the six parts of that harness, and how far along each one is. |
+| `docs/reminders.md` | How a reminder actually flows through the crates — the one feature that is finished. |
+| `docs/reference-notes.md` | Findings from reading the Python implementation this reimplements. |
+| `.claude/skills/serana/SKILL.md` | The engineering rules: layering, the approved crate stack, the testing contract. Binding for every change. |
