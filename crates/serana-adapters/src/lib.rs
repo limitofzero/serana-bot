@@ -5,11 +5,13 @@
 //! — so the dependency direction is checked by cargo rather than by review.
 
 pub mod clock;
+pub mod conversations;
 pub mod ids;
 pub mod llm;
 pub mod reminders;
 
 pub use clock::SystemClock;
+pub use conversations::SqliteConversationRepository;
 pub use ids::RandomIds;
 pub use llm::{OpenAiConfig, OpenAiProvider};
 pub use reminders::SqliteReminderRepository;

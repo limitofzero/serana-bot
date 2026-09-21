@@ -10,27 +10,42 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serana_adapters::{OpenAiConfig, OpenAiProvider, RandomIds, SqliteReminderRepository};
+use serana_adapters::{
+    OpenAiConfig, OpenAiProvider, RandomIds, SqliteConversationRepository, SqliteReminderRepository,
+};
 use serana_app::{Command, respond};
+use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::{MonthDays, Recurrence, ReminderRepository, TimeZoneName, UserId};
-use serana_services::{ReminderConfig, ReminderService, SchedulerService};
+use serana_services::{
+    DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
+};
 use serana_testkit::{FixedClock, RecordingNotifier};
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const OWNER: UserId = UserId::new(42);
+
+fn chat() -> ConversationId {
+    ConversationId::new("tg:42")
+}
 /// 10:00 in Tbilisi.
 const CREATED_AT: &str = "2026-03-10T06:00:00Z";
 
-type Service =
-    ReminderService<SqliteReminderRepository, OpenAiProvider, Arc<FixedClock>, RandomIds>;
+type Service = ReminderService<
+    SqliteReminderRepository,
+    OpenAiProvider,
+    Arc<FixedClock>,
+    RandomIds,
+    SqliteConversationRepository,
+>;
 
 struct Harness {
     /// Held so the database file outlives the test.
     _dir: TempDir,
     database: std::path::PathBuf,
     repository: SqliteReminderRepository,
+    conversations: SqliteConversationRepository,
     service: Service,
     clock: Arc<FixedClock>,
 }
@@ -75,6 +90,7 @@ async fn harness(server: &MockServer) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("serana.db");
     let repository = SqliteReminderRepository::open(&database).await.unwrap();
+    let conversations = SqliteConversationRepository::open(&database).await.unwrap();
     let clock = Arc::new(FixedClock::at(CREATED_AT));
 
     let provider = OpenAiProvider::new(OpenAiConfig {
@@ -91,10 +107,13 @@ async fn harness(server: &MockServer) -> Harness {
         provider,
         Arc::clone(&clock),
         RandomIds,
+        conversations.clone(),
         ReminderConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
             temperature: None,
+            summary_model: None,
+            compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
         },
     );
 
@@ -102,6 +121,7 @@ async fn harness(server: &MockServer) -> Harness {
         _dir: dir,
         database,
         repository,
+        conversations,
         service,
         clock,
     }
@@ -125,10 +145,13 @@ fn rebuild_service(server: &MockServer, existing: &Harness) -> Service {
         provider,
         Arc::clone(&existing.clock),
         RandomIds,
+        existing.conversations.clone(),
         ReminderConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
             temperature: None,
+            summary_model: None,
+            compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
         },
     )
 }
@@ -137,7 +160,7 @@ fn rebuild_service(server: &MockServer, existing: &Harness) -> Service {
 fn id_from(reply: &str) -> String {
     reply
         .lines()
-        .find_map(|line| line.trim().strip_prefix("id: "))
+        .find_map(|line| line.trim().strip_prefix("🆔 "))
         .unwrap_or_else(|| panic!("no id in reply:\n{reply}"))
         .trim()
         .to_owned()
@@ -152,6 +175,7 @@ async fn a_request_becomes_a_stored_reminder_that_later_arrives() {
     let reply = respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("каждый месяц 20 число - писать мне что надо оформить invoice".into()),
     )
     .await;
@@ -212,6 +236,7 @@ async fn the_model_is_asked_in_the_wire_format_it_expects() {
     respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("каждый месяц 20 число".into()),
     )
     .await;
@@ -222,14 +247,23 @@ async fn the_model_is_asked_in_the_wire_format_it_expects() {
 
     // The system prompt leads, carries the local date so "tomorrow" is resolvable, and the
     // extraction function is offered.
+    // The system message is the static instructions; the moment and the reminder list ride
+    // the user message, so the system prompt stays byte-stable across a conversation.
     assert_eq!(body["messages"][0]["role"], "system");
+    let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(
-        body["messages"][0]["content"]
+        system.contains("You manage a person's reminders"),
+        "{system}"
+    );
+    assert!(!system.contains("2026-03-10"), "{system}");
+
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert!(
+        body["messages"][1]["content"]
             .as_str()
             .unwrap()
             .contains("2026-03-10")
     );
-    assert_eq!(body["messages"][1]["role"], "user");
     // All four actions are offered on every turn — the model picks the verb.
     let offered: Vec<&str> = body["tools"]
         .as_array()
@@ -264,12 +298,13 @@ async fn a_reminder_listed_and_then_deleted_leaves_the_database_empty() {
     let created = respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("каждый месяц 20".into()),
     )
     .await;
     let id = id_from(&created);
 
-    let listing = respond(&h.service, OWNER, &Command::Reminders).await;
+    let listing = respond(&h.service, OWNER, &chat(), &Command::Reminders).await;
     assert!(listing.contains("оформить invoice"), "{listing}");
     assert!(listing.contains(&id), "{listing}");
 
@@ -283,6 +318,7 @@ async fn a_reminder_listed_and_then_deleted_leaves_the_database_empty() {
     let deleted = respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("remove the invoice reminder".into()),
     )
     .await;
@@ -303,6 +339,7 @@ async fn a_one_off_is_delivered_once_and_then_stops_for_good() {
     respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("15 марта в 9 позвонить в банк".into()),
     )
     .await;
@@ -337,6 +374,7 @@ async fn a_month_of_downtime_produces_one_message_not_thirty() {
     respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("каждый день в 10".into()),
     )
     .await;
@@ -370,6 +408,7 @@ async fn a_model_outage_leaves_nothing_behind_and_says_so() {
     let reply = respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("каждый день в 10".into()),
     )
     .await;
@@ -384,6 +423,7 @@ async fn reminders_from_before_a_restart_still_fire_after_it() {
     respond(
         &h.service,
         OWNER,
+        &chat(),
         &Command::Reminder("каждый месяц 20 число".into()),
     )
     .await;

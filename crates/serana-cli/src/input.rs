@@ -33,6 +33,7 @@ pub fn parse(line: &str) -> Input {
         "help" | "h" | "?" => Input::Command(Command::Help),
         "reminder" => Input::Command(Command::Reminder(rest.to_owned())),
         "reminders" => Input::Command(Command::Reminders),
+        "compact" => Input::Command(Command::Compact),
         "quit" | "exit" | "q" => Input::Quit,
         other => Input::Unknown(other.to_owned()),
     }

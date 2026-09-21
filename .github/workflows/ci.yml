@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The advisory database changes without the code changing, so the audit is worth running
+  # on a timer rather than only when something is pushed.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned, and deliberately the same version as the `rust:` builder in Dockerfile. Clippy
+  # warnings are errors in this repo, so a floating toolchain would turn a new upstream lint
+  # into a red build on an unrelated pull request. Bump both together.
+  RUST_VERSION: "1.97"
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No test needs the network or an API key: the provider is a wiremock server and the
+      # clock is injected. If this ever needs a secret, something has broken the contract.
+      - name: cargo test
+        run: cargo test --workspace
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Plain `cargo audit`, not `--deny warnings`: it fails on actual vulnerabilities and
+      # tolerates "unmaintained" notices. One of those is outstanding and unfixable from
+      # here — teloxide pulls proc-macro-error2 through aquamarine (RUSTSEC-2026-0173). It
+      # is a build-time proc macro and never reaches the runtime image. Denying warnings
+      # would mean a permanently red build for something we cannot act on.
+      - name: cargo audit
+        run: cargo audit
+
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: serana:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A build that succeeds proves nothing about a binary that runs: the builder and the
+      # runtime are separate images, and a runtime older than the builder fails at exec with
+      # a GLIBC_* error that no compile step can catch. These two runs are that regression
+      # test. Both are offline — `/help` reaches no provider, and the bot is expected to
+      # stop at its own configuration check.
+      - name: The REPL runs in the runtime image
+        run: |
+          printf '/help\n' | docker run --rm -i \
+            -e SERANA_API_KEY=ci \
+            -e SERANA_BASE_URL=http://127.0.0.1:1 \
+            -e SERANA_USER_ID=1 \
+            -e SERANA_DATA_DIR=/tmp/ci \
+            --network none \
+            --entrypoint serana serana:ci | tee /tmp/repl.out
+          grep -q "I am Serana" /tmp/repl.out
+
+      - name: The bot runs in the runtime image
+        run: |
+          docker run --rm -e SERANA_API_KEY=ci --network none \
+            --entrypoint serana-tg serana:ci 2>&1 | tee /tmp/bot.out || true
+          grep -q "TELEGRAM_BOT_TOKEN is not set" /tmp/bot.out
+
+      # A new system library added to the runtime stage without being needed is easy to
+      # miss; OpenSSL creeping back in via a crate's default features is not obvious at all.
+      - name: TLS is still rustls, with no OpenSSL linked
+        run: |
+          docker run --rm --entrypoint sh serana:ci -c \
+            'ldd /usr/local/bin/serana-tg | grep -qi ssl && exit 1 || exit 0'

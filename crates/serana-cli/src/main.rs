@@ -6,6 +6,7 @@ use anyhow::{Context, bail};
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use serana_app::{AppConfig, build_reminders, respond, text};
 use serana_cli::{Input, parse};
+use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::UserId;
 
 /// Reminders are owned by a Telegram user id so that one set to here is delivered to the
@@ -39,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     let owner = owner_from_env()?;
     let wiring = build_reminders(&config).await?;
+    // The REPL talks in the same conversation as the bot, keyed by the same owner, so a
+    // question asked in one can be answered in the other.
+    let conversation = ConversationId::new(format!("tg:{owner}"));
 
     println!("Serana — {} · {}", config.model, config.timezone);
     println!("{}\n", text::HELP);
@@ -54,7 +58,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("Unknown command \"{word}\". See /help for the list.\n");
             }
             Input::Command(command) => {
-                println!("{}\n", respond(&wiring.reminders, owner, &command).await);
+                println!(
+                    "{}\n",
+                    respond(&wiring.reminders, owner, &conversation, &command).await
+                );
             }
         }
     }

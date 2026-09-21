@@ -1,6 +1,8 @@
 /target
-.env
 /memory
-
-.env
 recipe.json
+
+# Every local env file, however it is suffixed — a `.env.bak` or `.env.prod` carries the
+# same secrets as `.env` and is far easier to commit by accident.
+.env*
+!.env.example

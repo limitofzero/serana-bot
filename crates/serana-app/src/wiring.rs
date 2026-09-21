@@ -8,16 +8,24 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use serana_adapters::{
-    OpenAiConfig, OpenAiProvider, RandomIds, SqliteReminderRepository, SystemClock,
+    OpenAiConfig, OpenAiProvider, RandomIds, SqliteConversationRepository,
+    SqliteReminderRepository, SystemClock,
 };
 use serana_domain::reminder::Notifier;
-use serana_services::{ReminderConfig, ReminderService, SchedulerService};
+use serana_services::{
+    DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
+};
 
 use crate::AppConfig;
 
 /// The reminder service, with every port resolved to its real implementation.
-pub type Reminders =
-    ReminderService<SqliteReminderRepository, Arc<OpenAiProvider>, SystemClock, RandomIds>;
+pub type Reminders = ReminderService<
+    SqliteReminderRepository,
+    Arc<OpenAiProvider>,
+    SystemClock,
+    RandomIds,
+    SqliteConversationRepository,
+>;
 
 /// What a frontend gets after wiring.
 pub struct Wiring {
@@ -43,15 +51,22 @@ pub async fn build_reminders(config: &AppConfig) -> anyhow::Result<Wiring> {
         &config.api_key,
     ))?);
 
+    let conversations = SqliteConversationRepository::open(config.database_path())
+        .await
+        .with_context(|| format!("could not open {}", config.database_path().display()))?;
+
     let reminders = ReminderService::new(
         repository.clone(),
         provider,
         SystemClock,
         RandomIds,
+        conversations,
         ReminderConfig {
             model: config.model.clone(),
+            summary_model: config.auxiliary_model.clone(),
             default_timezone: config.timezone.clone(),
             temperature: config.temperature,
+            compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
         },
     );
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use serana_app::{AppConfig, Command, Reminders, build_reminders, build_scheduler, respond, text};
+use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::UserId;
 use serana_tg::TelegramCommand;
 use serana_tg::config::TelegramConfig;
@@ -64,9 +65,16 @@ async fn main() -> anyhow::Result<()> {
         reminders: wiring.reminders,
         telegram,
     });
+    // Two branches over the same messages: a slash command, or anything else. Without the
+    // second, an answer to a question the assistant just asked ("tomorrow at 9") would be
+    // silently dropped, which is the one thing a conversation cannot afford.
     let handler = Update::filter_message()
-        .filter_command::<TelegramCommand>()
-        .endpoint(dispatch);
+        .branch(
+            dptree::entry()
+                .filter_command::<TelegramCommand>()
+                .endpoint(dispatch),
+        )
+        .branch(dptree::endpoint(dispatch_text));
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
@@ -77,10 +85,47 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Send `body` back, logging rather than failing the update if it cannot be delivered.
+async fn reply(bot: &Bot, message: &Message, body: String) {
+    if let Err(error) = bot.send_message(message.chat.id, body).await {
+        tracing::warn!(%error, "could not send a reply");
+    }
+}
+
+/// A message that is not a command: treated as a continuation of the conversation.
+async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyhow::Result<()> {
+    let Some(text) = message
+        .text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+    else {
+        // Stickers, photos, joins — nothing to read.
+        return Ok(());
+    };
+    // A slash-prefixed word that reached here is a command we do not have; answering it as
+    // a reminder request would be worse than saying so.
+    if text.starts_with('/') {
+        reply(&bot, &message, text::UNKNOWN_COMMAND.to_owned()).await;
+        return Ok(());
+    }
+    answer(bot, message, Command::Reminder(text), state).await
+}
+
 async fn dispatch(
     bot: Bot,
     message: Message,
     command: TelegramCommand,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    answer(bot, message, Command::from(command), state).await
+}
+
+/// Check the sender, run the command, send the reply.
+async fn answer(
+    bot: Bot,
+    message: Message,
+    command: Command,
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
     let Some(sender) = message
@@ -93,7 +138,13 @@ async fn dispatch(
     };
 
     let reply = if state.telegram.allows(sender) {
-        respond(&state.reminders, sender, &Command::from(command)).await
+        respond(
+            &state.reminders,
+            sender,
+            &ConversationId::new(format!("tg:{sender}")),
+            &command,
+        )
+        .await
     } else {
         // Logged at warn so an owner who mistyped their own id can see why nothing works.
         tracing::warn!(user = %sender, "refused a command from a user outside the allowlist");

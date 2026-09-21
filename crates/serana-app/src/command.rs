@@ -17,6 +17,9 @@ pub enum Command {
     /// no model call and cannot be misread — which is exactly what you want when the model
     /// has just misunderstood something.
     Reminders,
+    /// Summarise the conversation so far and carry on from the summary. The history is
+    /// what lets a follow-up answer land, so this folds it up rather than discarding it.
+    Compact,
 }
 
 #[cfg(test)]

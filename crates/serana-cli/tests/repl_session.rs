@@ -123,7 +123,7 @@ async fn a_reminder_created_in_the_repl_is_listed_back_and_then_deleted() {
 
     let id = transcript
         .lines()
-        .find_map(|line| line.trim().strip_prefix("id: "))
+        .find_map(|line| line.trim().strip_prefix("🆔 "))
         .expect("the confirmation carries an id")
         .trim()
         .to_owned();

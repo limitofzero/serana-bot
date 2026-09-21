@@ -23,8 +23,11 @@ impl TelegramNotifier {
 #[async_trait]
 impl Notifier for TelegramNotifier {
     async fn notify(&self, owner: UserId, text: &str) -> Result<(), NotifyError> {
+        // Presented, not passed through: a delivery arrives unprompted and has to read as a
+        // reminder rather than as the assistant saying something. The wording lives in
+        // `serana-app` with every other line the user sees.
         self.bot
-            .send_message(ChatId(owner.get()), text)
+            .send_message(ChatId(owner.get()), serana_app::text::fired(text))
             .await
             .map(|_| ())
             .map_err(classify)

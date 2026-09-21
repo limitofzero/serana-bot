@@ -9,25 +9,32 @@ use serana_domain::reminder::{MonthDays, Recurrence, Reminder, Weekday};
 use serana_services::ReminderOutcome;
 
 pub const HELP: &str = "\
-I am Serana, your assistant.
+Serana — your reminders, in plain words.
 
-/reminder <anything> — set, change, remove or finish a reminder, in plain words
-/reminders — list your reminders
+/reminder — set, change, remove or finish one
+/reminders — list them
+/compact — fold this conversation up into a summary
 /help — this message
 
-For example:
-/reminder every month on the 20th, tell me to issue an invoice";
+Just say what you want:
+  /reminder every month on the 20th, issue an invoice
+  /reminder move the invoice one to 22:30
+  /reminder I already sent the invoice
+  /reminder remove the invoice reminder";
 
 pub const REMINDER_NEEDS_TEXT: &str = "Say what to remind you about, and when.\n\
      For example: /reminder every month on the 20th, issue an invoice";
 
-pub const DELETE_NEEDS_ID: &str =
-    "Give the id of the reminder to delete.\nYou can see them with /reminders";
+pub const NO_REMINDERS: &str =
+    "No reminders yet.\nSet one: /reminder every month on the 20th, issue an invoice";
 
-pub const DONE_NEEDS_ID: &str =
-    "Give the id of the reminder you have dealt with.\nYou can see them with /reminders";
+pub const COMPACTED: &str =
+    "🧹 Folded the conversation up into a summary. I still know where we got to.";
 
-pub const NO_REMINDERS: &str = "No reminders yet. Set one with /reminder";
+pub const NOTHING_TO_COMPACT: &str = "Nothing to fold up yet.";
+
+pub const UNKNOWN_COMMAND: &str =
+    "I do not know that command.\nJust say what you want — /help lists what I can do.";
 
 pub const NOT_ALLOWED: &str = "This is a personal bot and does not answer you.";
 
@@ -148,10 +155,14 @@ fn next_fire(reminder: &Reminder) -> String {
     )
 }
 
-/// Confirmation after creating a reminder.
-pub fn created(reminder: &Reminder) -> String {
+/// Every confirmation has the same shape, so the eye learns where to look: what it is
+/// about, then the schedule, then when it next lands, then the id.
+///
+/// The id goes last and unlabelled — it matters only when something has gone wrong, and a
+/// line of machine noise at the top pushes the schedule (the part worth checking) down.
+fn confirmation(badge: &str, reminder: &Reminder, when: &str) -> String {
     format!(
-        "Set: {}\nSchedule: {}\nNext: {}\nid: {}",
+        "{badge} {}\n\n🗓 {}\n⏰ {when} {}\n🆔 {}",
         reminder.text,
         describe(&reminder.recurrence),
         next_fire(reminder),
@@ -159,15 +170,27 @@ pub fn created(reminder: &Reminder) -> String {
     )
 }
 
+/// Confirmation after creating a reminder.
+pub fn created(reminder: &Reminder) -> String {
+    confirmation("✅", reminder, "next")
+}
+
 /// One line per reminder.
 pub fn listing(reminders: &[Reminder]) -> String {
     if reminders.is_empty() {
         return NO_REMINDERS.to_owned();
     }
-    let mut out = String::from("Your reminders:\n");
-    for reminder in reminders {
+    let mut out = String::new();
+    for (index, reminder) in reminders.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        // A spent reminder is still listed — it is the one the user is most likely hunting
+        // for — but it should not look like something that is still going to happen.
+        let bell = if reminder.is_active() { "⏰" } else { "🔕" };
         out.push_str(&format!(
-            "\n• {}\n  {} — next {}\n  id: {}\n",
+            "{} {}\n   🗓 {}\n   {bell} {}\n   🆔 {}\n",
+            if reminder.is_active() { "•" } else { "◦" },
             reminder.text,
             describe(&reminder.recurrence),
             next_fire(reminder),
@@ -183,23 +206,29 @@ pub fn listing(reminders: &[Reminder]) -> String {
 /// not "did it register" but "when does this come back".
 pub fn acknowledged(reminder: &Reminder) -> String {
     match reminder.next_fire_at {
-        Some(_) => format!("Done: {}\nBack on: {}", reminder.text, next_fire(reminder)),
-        None => format!("Done: {}\nNothing further scheduled.", reminder.text),
+        Some(_) => format!(
+            "✔️ Done — {}\n\n🔕 quiet until {}",
+            reminder.text,
+            next_fire(reminder)
+        ),
+        None => format!("✔️ Done — {}\n\nNothing further scheduled.", reminder.text),
     }
 }
 
+/// A reminder as it arrives when it fires.
+///
+/// The bell is the whole point: this message is unprompted, so it has to be recognisable as
+/// a reminder at a glance rather than read as the assistant talking.
+pub fn fired(text: &str) -> String {
+    format!("⏰ {text}")
+}
+
 pub fn deleted(reminder: &Reminder) -> String {
-    format!("Deleted: {}", reminder.text)
+    format!("🗑 Deleted — {}", reminder.text)
 }
 
 pub fn updated(reminder: &Reminder) -> String {
-    format!(
-        "Updated: {}\nSchedule: {}\nNext: {}\nid: {}",
-        reminder.text,
-        describe(&reminder.recurrence),
-        next_fire(reminder),
-        reminder.id
-    )
+    confirmation("✏️ Updated —", reminder, "next")
 }
 
 /// What to say after a reminder turn.
@@ -432,7 +461,7 @@ mod tests {
             ),
         ];
         let message = listing(&reminders);
-        assert_eq!(message.matches("id: a3f9k2xy").count(), 2, "{message}");
+        assert_eq!(message.matches("🆔 a3f9k2xy").count(), 2, "{message}");
         assert!(message.contains("every day at 09:00"), "{message}");
         assert!(
             message.contains("every month on the 20th at 10:00"),

@@ -24,6 +24,9 @@ pub struct AppConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// A cheaper model for side work nobody reads — compaction summaries today. `None`
+    /// means use [`Self::model`].
+    pub auxiliary_model: Option<String>,
     pub timezone: TimeZoneName,
     pub data_dir: PathBuf,
     pub tick_interval: Duration,
@@ -66,6 +69,10 @@ impl AppConfig {
             api_key,
             base_url: var_or("SERANA_BASE_URL", DEFAULT_BASE_URL),
             model: var_or("SERANA_MODEL", DEFAULT_MODEL),
+            auxiliary_model: std::env::var("SERANA_AUXILIARY_MODEL")
+                .ok()
+                .map(|raw| raw.trim().to_owned())
+                .filter(|raw| !raw.is_empty()),
             timezone,
             data_dir: PathBuf::from(var_or("SERANA_DATA_DIR", DEFAULT_DATA_DIR)),
             tick_interval: Duration::from_secs(tick_seconds),
@@ -94,6 +101,7 @@ mod tests {
             api_key: "k".into(),
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
+            auxiliary_model: None,
             timezone: TimeZoneName::new(DEFAULT_TIMEZONE),
             data_dir: PathBuf::from("/data"),
             tick_interval: Duration::from_secs(60),

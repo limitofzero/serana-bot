@@ -17,6 +17,8 @@ pub enum TelegramCommand {
     Reminder(String),
     /// List your reminders.
     Reminders,
+    /// Fold this conversation up into a summary.
+    Compact,
 }
 
 impl From<TelegramCommand> for Command {
@@ -26,6 +28,7 @@ impl From<TelegramCommand> for Command {
             TelegramCommand::Help | TelegramCommand::Start => Self::Help,
             TelegramCommand::Reminder(request) => Self::Reminder(request),
             TelegramCommand::Reminders => Self::Reminders,
+            TelegramCommand::Compact => Self::Compact,
         }
     }
 }
@@ -60,7 +63,7 @@ mod tests {
             .collect();
         assert_eq!(
             registered,
-            vec!["/help", "/start", "/reminder", "/reminders"]
+            vec!["/help", "/start", "/reminder", "/reminders", "/compact"]
         );
     }
 

@@ -7,12 +7,14 @@
 //! never against a fake of itself.
 
 pub mod clock;
+pub mod conversations;
 pub mod llm;
 pub mod notifier;
 pub mod reminders;
 pub mod tools;
 
 pub use clock::FixedClock;
+pub use conversations::InMemoryConversationRepository;
 pub use llm::ScriptedLlm;
 pub use notifier::RecordingNotifier;
 pub use reminders::InMemoryReminderRepository;

@@ -4,6 +4,8 @@
 //! the command surface testable: the tests below drive the real service against fakes and
 //! assert on exactly what the user would read.
 
+use serana_domain::conversation::ConversationId;
+use serana_domain::conversation_store::ConversationRepository;
 use serana_domain::reminder::{ReminderRepository, UserId};
 use serana_domain::{Clock, IdGenerator, LlmProvider};
 use serana_services::{ReminderError, ReminderService};
@@ -11,9 +13,10 @@ use serana_services::{ReminderError, ReminderService};
 use crate::{Command, text};
 
 /// Produce the reply for `command`, issued by `user`.
-pub async fn respond<R, L, C, I>(
-    service: &ReminderService<R, L, C, I>,
+pub async fn respond<R, L, C, I, V>(
+    service: &ReminderService<R, L, C, I, V>,
     user: UserId,
+    conversation: &ConversationId,
     command: &Command,
 ) -> String
 where
@@ -21,6 +24,7 @@ where
     L: LlmProvider,
     C: Clock,
     I: IdGenerator,
+    V: ConversationRepository,
 {
     match command {
         Command::Help => text::HELP.to_owned(),
@@ -28,8 +32,14 @@ where
         Command::Reminder(request) if request.trim().is_empty() => {
             text::REMINDER_NEEDS_TEXT.to_owned()
         }
-        Command::Reminder(request) => match service.handle(user, request).await {
+        Command::Reminder(request) => match service.handle(user, conversation, request).await {
             Ok(outcome) => text::outcome(&outcome),
+            Err(error) => render_error(&error),
+        },
+
+        Command::Compact => match service.compact_conversation(conversation).await {
+            Ok(true) => text::COMPACTED.to_owned(),
+            Ok(false) => text::NOTHING_TO_COMPACT.to_owned(),
             Err(error) => render_error(&error),
         },
 
@@ -70,17 +80,29 @@ mod tests {
 
     use serana_domain::message::ToolCall;
     use serana_domain::reminder::TimeZoneName;
-    use serana_services::ReminderConfig;
-    use serana_testkit::{FixedClock, InMemoryReminderRepository, ScriptedLlm, SequentialIds};
+    use serana_services::{DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig};
+    use serana_testkit::{
+        FixedClock, InMemoryConversationRepository, InMemoryReminderRepository, ScriptedLlm,
+        SequentialIds,
+    };
 
     use super::*;
     use crate::text;
 
+    fn chat() -> ConversationId {
+        ConversationId::new("test")
+    }
+
     const OWNER: UserId = UserId::new(42);
     const OTHER: UserId = UserId::new(7);
 
-    type Service =
-        ReminderService<InMemoryReminderRepository, Arc<ScriptedLlm>, FixedClock, SequentialIds>;
+    type Service = ReminderService<
+        InMemoryReminderRepository,
+        Arc<ScriptedLlm>,
+        FixedClock,
+        SequentialIds,
+        InMemoryConversationRepository,
+    >;
 
     /// Returns the service and a handle on its scripted model, so a test can assert that
     /// a command did *not* reach the provider.
@@ -91,10 +113,13 @@ mod tests {
             Arc::clone(&llm),
             FixedClock::at("2026-03-10T06:00:00Z"),
             SequentialIds::default(),
+            InMemoryConversationRepository::new(),
             ReminderConfig {
                 model: "gpt-5-mini".into(),
                 default_timezone: TimeZoneName::new("Asia/Tbilisi"),
                 temperature: None,
+                summary_model: None,
+                compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
             },
         );
         (service, llm)
@@ -121,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn help_explains_the_commands() {
         let service = service(ScriptedLlm::new());
-        let reply = respond(&service, OWNER, &Command::Help).await;
+        let reply = respond(&service, OWNER, &chat(), &Command::Help).await;
         assert!(reply.contains("/reminder"), "{reply}");
     }
 
@@ -131,6 +156,7 @@ mod tests {
         let reply = respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder(
                 "каждый месяц 20 число - писать мне что надо оформить invoice".into(),
             ),
@@ -149,7 +175,13 @@ mod tests {
     async fn a_bare_reminder_command_asks_for_the_missing_text_without_calling_the_model() {
         let (service, llm) = service_with_llm(ScriptedLlm::new());
         for argument in ["", "   "] {
-            let reply = respond(&service, OWNER, &Command::Reminder(argument.into())).await;
+            let reply = respond(
+                &service,
+                OWNER,
+                &chat(),
+                &Command::Reminder(argument.into()),
+            )
+            .await;
             assert_eq!(reply, text::REMINDER_NEEDS_TEXT);
         }
         assert_eq!(llm.call_count(), 0, "no tokens spent on an empty command");
@@ -159,7 +191,7 @@ mod tests {
     async fn an_empty_list_invites_the_user_to_create_one() {
         let service = service(ScriptedLlm::new());
         assert_eq!(
-            respond(&service, OWNER, &Command::Reminders).await,
+            respond(&service, OWNER, &chat(), &Command::Reminders).await,
             text::NO_REMINDERS
         );
     }
@@ -167,12 +199,12 @@ mod tests {
     #[tokio::test]
     async fn a_listing_shows_only_your_own_reminders() {
         let service = service(extracting(2));
-        respond(&service, OWNER, &Command::Reminder("мне".into())).await;
-        respond(&service, OTHER, &Command::Reminder("им".into())).await;
+        respond(&service, OWNER, &chat(), &Command::Reminder("мне".into())).await;
+        respond(&service, OTHER, &chat(), &Command::Reminder("им".into())).await;
 
-        let reply = respond(&service, OWNER, &Command::Reminders).await;
-        assert_eq!(reply.matches("id: ").count(), 1, "{reply}");
-        assert!(reply.contains("id: r1"), "{reply}");
+        let reply = respond(&service, OWNER, &chat(), &Command::Reminders).await;
+        assert_eq!(reply.matches("🆔 ").count(), 1, "{reply}");
+        assert!(reply.contains("🆔 r1"), "{reply}");
     }
 
     #[tokio::test]
@@ -181,12 +213,24 @@ mod tests {
             "delete_reminder",
             serde_json::json!({ "id": "  r1  " }),
         ));
-        respond(&service, OWNER, &Command::Reminder("что-то".into())).await;
+        respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("что-то".into()),
+        )
+        .await;
 
-        let reply = respond(&service, OWNER, &Command::Reminder("remove it".into())).await;
+        let reply = respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("remove it".into()),
+        )
+        .await;
         assert!(reply.contains("Deleted"), "{reply}");
         assert_eq!(
-            respond(&service, OWNER, &Command::Reminders).await,
+            respond(&service, OWNER, &chat(), &Command::Reminders).await,
             text::NO_REMINDERS
         );
     }
@@ -232,6 +276,7 @@ mod tests {
         respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("каждый месяц 20".into()),
         )
         .await;
@@ -239,6 +284,7 @@ mod tests {
         let reply = respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("remove the invoice reminder".into()),
         )
         .await;
@@ -256,6 +302,7 @@ mod tests {
         respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("каждый месяц 20".into()),
         )
         .await;
@@ -263,11 +310,12 @@ mod tests {
         let reply = respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("already sent the invoice".into()),
         )
         .await;
         assert!(reply.contains("Done"), "{reply}");
-        assert!(reply.contains("Back on"), "{reply}");
+        assert!(reply.contains("quiet until"), "{reply}");
         assert_eq!(
             service.list(OWNER).await.unwrap().len(),
             1,
@@ -288,6 +336,7 @@ mod tests {
         respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("каждый месяц 20".into()),
         )
         .await;
@@ -295,6 +344,7 @@ mod tests {
         let reply = respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("make it the 20th to the 26th at 22:30".into()),
         )
         .await;
@@ -317,6 +367,7 @@ mod tests {
         let reply = respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("remove the invoice reminder".into()),
         )
         .await;
@@ -332,11 +383,18 @@ mod tests {
         respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("каждый месяц 20".into()),
         )
         .await;
 
-        let reply = respond(&service, OTHER, &Command::Reminder("remove it".into())).await;
+        let reply = respond(
+            &service,
+            OTHER,
+            &chat(),
+            &Command::Reminder("remove it".into()),
+        )
+        .await;
         assert!(reply.contains("No reminder with id"), "{reply}");
         assert_eq!(
             service.list(OWNER).await.unwrap().len(),
@@ -355,6 +413,7 @@ mod tests {
         let reply = respond(
             &service,
             OWNER,
+            &chat(),
             &Command::Reminder("remove something".into()),
         )
         .await;
@@ -367,7 +426,13 @@ mod tests {
             "drop_database",
             vec![serde_json::json!({ "id": "r1" })],
         ));
-        let reply = respond(&service, OWNER, &Command::Reminder("do something".into())).await;
+        let reply = respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("do something".into()),
+        )
+        .await;
         // Falls through to prose rather than being treated as an action.
         assert!(!reply.contains("Deleted"), "{reply}");
     }

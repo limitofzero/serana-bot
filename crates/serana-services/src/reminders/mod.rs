@@ -7,7 +7,9 @@ mod tools;
 
 use std::sync::Arc;
 
-use serana_domain::llm::{CompletionRequest, LlmProvider};
+use serana_domain::conversation::{Conversation, ConversationId};
+use serana_domain::conversation_store::ConversationRepository;
+use serana_domain::llm::{CompletionRequest, CompletionResponse, LlmProvider};
 use serana_domain::message::Message;
 use serana_domain::reminder::{
     Recurrence, Reminder, ReminderId, ReminderRepository, TimeZoneName, UserId,
@@ -17,6 +19,13 @@ use serana_domain::{Clock, IdGenerator, LlmError, StorageError};
 use parse::ParsedReminder;
 
 pub use scheduler::{SchedulerService, TickReport};
+
+impl ReminderConfig {
+    /// The model used for summarising, falling back to the main one.
+    pub fn summary_model(&self) -> &str {
+        self.summary_model.as_deref().unwrap_or(&self.model)
+    }
+}
 
 /// What one reminder turn did, so the frontend can say so without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +62,9 @@ pub enum ReminderError {
     Storage(#[from] StorageError),
 }
 
+/// Roughly a hundred and fifty exchanges at this assistant's size.
+pub const DEFAULT_COMPACT_ABOVE_TOKENS: u64 = 16_000;
+
 #[derive(Debug, Clone)]
 pub struct ReminderConfig {
     /// Model used to read the request. A small one is enough; this is extraction, not
@@ -60,6 +72,15 @@ pub struct ReminderConfig {
     pub model: String,
     /// Zone every new reminder is created in.
     pub default_timezone: TimeZoneName,
+    /// Model for summarising when a conversation is compacted. A smaller one is plenty:
+    /// nobody reads the summary but the model itself. Falls back to [`Self::model`].
+    pub summary_model: Option<String>,
+    /// Compact once the provider reports a prompt above this many tokens.
+    ///
+    /// Deliberately far off. Providers cache the prompt prefix, so a long *stable* history
+    /// costs much less than its token count suggests — while compaction costs a model call
+    /// and throws that cache away. Compacting early is the expensive choice.
+    pub compact_above_tokens: u64,
     /// Sampling temperature, or `None` to let the provider use its default.
     ///
     /// Extraction wants determinism, so 0 is the natural choice — but reasoning models
@@ -69,43 +90,70 @@ pub struct ReminderConfig {
     pub temperature: Option<f32>,
 }
 
+/// What the model is told came of its call, as the tool result for the next turn.
+///
+/// Short on purpose: it is re-sent with every subsequent turn, so a full reminder here is
+/// paid for over and over. The id and the verb are what a follow-up needs.
+fn summarise(outcome: &ReminderOutcome) -> String {
+    let (verb, reminder) = match outcome {
+        ReminderOutcome::Created(r) => ("created", r),
+        ReminderOutcome::Updated(r) => ("updated", r),
+        ReminderOutcome::Deleted(r) => ("deleted", r),
+        ReminderOutcome::Acknowledged(r) => ("acknowledged", r),
+        ReminderOutcome::Said(words) => return words.clone(),
+    };
+    serde_json::json!({ "ok": verb, "id": reminder.id.as_str() }).to_string()
+}
+
 /// Reminder lifecycle, independent of how the request arrived.
 ///
 /// Telegram's `/reminder` command calls this, and so will a `create_reminder` tool once the
 /// agent can set reminders conversationally. Neither knows anything the other does not.
-pub struct ReminderService<R, L, C, I> {
+pub struct ReminderService<R, L, C, I, V> {
     repository: R,
     llm: L,
     clock: C,
     ids: I,
+    conversations: V,
     config: ReminderConfig,
 }
 
-impl<R, L, C, I> ReminderService<R, L, C, I>
+impl<R, L, C, I, V> ReminderService<R, L, C, I, V>
 where
     R: ReminderRepository,
     L: LlmProvider,
     C: Clock,
     I: IdGenerator,
+    V: ConversationRepository,
 {
-    pub fn new(repository: R, llm: L, clock: C, ids: I, config: ReminderConfig) -> Self {
+    pub fn new(
+        repository: R,
+        llm: L,
+        clock: C,
+        ids: I,
+        conversations: V,
+        config: ReminderConfig,
+    ) -> Self {
         Self {
             repository,
             llm,
             clock,
             ids,
+            conversations,
             config,
         }
     }
 
-    /// Handle one "/reminder <anything>" turn: work out what the person wants and do it.
+    /// Handle one turn: work out what the person wants and do it.
     ///
-    /// One model call, not a loop. The person's existing reminders ride in the prompt, so
-    /// the model can resolve "the salary invoice one" without a lookup round-trip, and the
-    /// single tool call it makes is the whole turn.
+    /// The conversation is loaded, extended and saved, so an answer to a question the model
+    /// asked last turn lands with that question still in front of it. Only the turns that
+    /// reach the model are recorded — a turn that fails before then leaves the history
+    /// exactly as it was, rather than storing a message nothing ever replied to.
     pub async fn handle(
         &self,
         owner: UserId,
+        conversation: &ConversationId,
         request: &str,
     ) -> Result<ReminderOutcome, ReminderError> {
         if request.trim().is_empty() {
@@ -117,26 +165,31 @@ where
         let local = now.to_zoned(timezone.resolve()?);
         let existing = self.repository.list_for_owner(owner).await?;
 
-        let mut call = CompletionRequest::new(
-            &self.config.model,
-            Arc::from(prompt::build(&local, &timezone, &existing).as_str()),
-            vec![Message::user(request)],
-        )
-        .with_tools(tools::specs());
-        if let Some(temperature) = self.config.temperature {
-            call = call.with_temperature(temperature);
-        }
+        let mut history = self
+            .conversations
+            .load(conversation)
+            .await?
+            .unwrap_or_else(|| Conversation::new(conversation.clone(), prompt::INSTRUCTIONS, now));
 
-        let response = self.llm.complete(call).await?;
+        history
+            .push_user(format!(
+                "{}\n{request}",
+                prompt::context(&local, &timezone, &existing)
+            ))
+            .map_err(|e| ReminderError::Storage(StorageError::Corrupt(e.to_string())))?;
+
+        let response = self.ask(&history).await?;
 
         // A name we do not offer is a hallucination, not an action: fall through to the
         // model's own prose rather than dispatching something we cannot check.
-        let Some(call) = response
+        let chosen = response
             .tool_calls
-            .into_iter()
+            .iter()
             .find(|call| tools::is_known(&call.name))
-        else {
-            return Ok(ReminderOutcome::Said(
+            .cloned();
+
+        let outcome = match chosen {
+            None => ReminderOutcome::Said(
                 response
                     .content
                     .as_deref()
@@ -144,14 +197,160 @@ where
                     .filter(|text| !text.is_empty())
                     .unwrap_or("I could not work out what you wanted there.")
                     .to_owned(),
-            ));
+            ),
+            Some(call) => {
+                let arguments = call.parse_arguments().map_err(|e| {
+                    ReminderError::Unparsable(format!("the answer came back malformed: {e}"))
+                })?;
+                self.dispatch(owner, now, &timezone, &call.name, arguments)
+                    .await?
+            }
         };
 
-        let arguments = call.parse_arguments().map_err(|e| {
-            ReminderError::Unparsable(format!("the answer came back malformed: {e}"))
-        })?;
-        self.dispatch(owner, now, &timezone, &call.name, arguments)
-            .await
+        self.record(&mut history, &response, &outcome)?;
+
+        // Compaction is the one sanctioned cache break, so it happens as late as possible:
+        // only once the provider says the history it is re-reading has grown past the
+        // threshold. `prompt_tokens` is the provider's own count, so there is no tokenizer
+        // to take on and no estimate to be wrong about.
+        if response.usage.prompt_tokens > self.config.compact_above_tokens {
+            self.compact(&mut history).await?;
+        }
+
+        self.conversations.save(&history).await?;
+        Ok(outcome)
+    }
+
+    /// Ask the model, with the whole conversation in front of it.
+    async fn ask(&self, history: &Conversation) -> Result<CompletionResponse, ReminderError> {
+        let mut call = CompletionRequest::new(
+            &self.config.model,
+            Arc::from(history.system_prompt()),
+            history.messages().to_vec(),
+        )
+        .with_tools(tools::specs());
+        if let Some(temperature) = self.config.temperature {
+            call = call.with_temperature(temperature);
+        }
+        Ok(self.llm.complete(call).await?)
+    }
+
+    /// Append what the model said, and what came of it, to the history.
+    ///
+    /// A tool call must be followed by exactly one result, on every path — leave one open
+    /// and the next turn starts `tool -> user`, which providers reject.
+    fn record(
+        &self,
+        history: &mut Conversation,
+        response: &CompletionResponse,
+        outcome: &ReminderOutcome,
+    ) -> Result<(), ReminderError> {
+        let corrupt = |e: serana_domain::AlternationError| {
+            ReminderError::Storage(StorageError::Corrupt(e.to_string()))
+        };
+
+        match outcome {
+            ReminderOutcome::Said(words) => history.push_assistant(words).map_err(corrupt),
+            _ => {
+                let calls = response.tool_calls.clone();
+                let Some(first) = calls.first().cloned() else {
+                    return Ok(());
+                };
+                history.push_tool_calls(calls).map_err(corrupt)?;
+                history
+                    .push_tool_result(&first.id, summarise(outcome))
+                    .map_err(corrupt)?;
+                // Anything the model asked for beyond the first call was never run; closing
+                // them keeps the alternation legal and tells the model why.
+                history.close_open_tool_calls("not run: one action per turn");
+                Ok(())
+            }
+        }
+    }
+
+    /// Summarise a stored conversation in place, at the user's request.
+    ///
+    /// Returns whether there was anything to summarise.
+    pub async fn compact_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<bool, ReminderError> {
+        let Some(mut history) = self.conversations.load(conversation).await? else {
+            return Ok(false);
+        };
+        if history.is_empty() {
+            return Ok(false);
+        }
+        self.compact(&mut history).await?;
+        self.conversations.save(&history).await?;
+        Ok(true)
+    }
+
+    /// Replace the history with a summary of itself, keeping the system prompt.
+    ///
+    /// Triggered by [`ReminderConfig::compact_above_tokens`], or by the user asking. The
+    /// summary arrives as a user message with an assistant acknowledgement after it, so the
+    /// conversation is left able to accept the next user message.
+    pub async fn compact(&self, history: &mut Conversation) -> Result<(), ReminderError> {
+        if history.is_empty() {
+            return Ok(());
+        }
+
+        let transcript = history
+            .messages()
+            .iter()
+            .map(|message| match message {
+                Message::User { content } => format!("them: {content}"),
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                } => match content {
+                    Some(text) => format!("you: {text}"),
+                    None => format!(
+                        "you: (called {})",
+                        tool_calls
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                },
+                Message::Tool { content, .. } => format!("result: {content}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let summary = self
+            .llm
+            .complete(CompletionRequest::new(
+                self.config.summary_model(),
+                Arc::from(prompt::SUMMARISE),
+                vec![Message::user(transcript)],
+            ))
+            .await?
+            .content
+            .unwrap_or_default();
+
+        let corrupt = |e: serana_domain::AlternationError| {
+            ReminderError::Storage(StorageError::Corrupt(e.to_string()))
+        };
+
+        // Same id, same system prompt, same creation time: it is the same conversation,
+        // with its middle replaced.
+        let mut compacted = Conversation::new(
+            history.id().clone(),
+            history.system_prompt(),
+            history.created_at(),
+        );
+        compacted
+            .push_user(format!(
+                "Notes on our earlier conversation:\n{}",
+                summary.trim()
+            ))
+            .map_err(corrupt)?;
+        compacted.push_assistant("Noted.").map_err(corrupt)?;
+        *history = compacted;
+        Ok(())
     }
 
     /// Run the action the model chose.
@@ -321,23 +520,34 @@ where
 
 #[cfg(test)]
 mod tests {
-    use serana_domain::message::ToolCall;
+    use serana_domain::message::{Message, ToolCall, Usage};
     use serana_domain::reminder::{MonthDays, Recurrence, WeekDays, Weekday};
-    use serana_testkit::{FixedClock, InMemoryReminderRepository, ScriptedLlm, SequentialIds};
+    use serana_domain::{CompletionResponse, LlmError};
+    use serana_testkit::{
+        FixedClock, InMemoryConversationRepository, InMemoryReminderRepository, ScriptedLlm,
+        SequentialIds,
+    };
 
     use super::*;
 
     const OWNER: UserId = UserId::new(42);
     const OTHER: UserId = UserId::new(7);
 
-    type Service =
-        ReminderService<InMemoryReminderRepository, ScriptedLlm, FixedClock, SequentialIds>;
+    type Service = ReminderService<
+        InMemoryReminderRepository,
+        ScriptedLlm,
+        FixedClock,
+        SequentialIds,
+        InMemoryConversationRepository,
+    >;
 
     fn config() -> ReminderConfig {
         ReminderConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
             temperature: None,
+            summary_model: None,
+            compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
         }
     }
 
@@ -349,6 +559,7 @@ mod tests {
             // 10:00 local in Tbilisi.
             FixedClock::at("2026-03-10T06:00:00Z"),
             SequentialIds::default(),
+            InMemoryConversationRepository::new(),
             config(),
         )
     }
@@ -362,13 +573,18 @@ mod tests {
         )])
     }
 
+    /// The conversation every test talks in, unless it is testing conversations.
+    fn chat() -> ConversationId {
+        ConversationId::new("test")
+    }
+
     /// Run a turn and expect it to have created a reminder.
     async fn create(
         service: &Service,
         owner: UserId,
         request: &str,
     ) -> Result<Reminder, ReminderError> {
-        match service.handle(owner, request).await? {
+        match service.handle(owner, &chat(), request).await? {
             ReminderOutcome::Created(reminder) => Ok(reminder),
             other => panic!("expected a creation, got {other:?}"),
         }
@@ -442,6 +658,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_question_and_its_answer_are_one_conversation() {
+        // The whole point of persistence: "tomorrow at 9" means nothing on its own.
+        let service = service(
+            ScriptedLlm::new()
+                .answering("What time should I remind you?")
+                .calling(vec![ToolCall::new(
+                    "call_1",
+                    tools::CREATE,
+                    serde_json::json!({
+                        "kind": "once", "time": "09:00", "date": "2026-03-11",
+                        "text": "call the bank"
+                    })
+                    .to_string(),
+                )]),
+        );
+
+        let asked = service
+            .handle(OWNER, &chat(), "remind me to call the bank")
+            .await
+            .unwrap();
+        assert_eq!(
+            asked,
+            ReminderOutcome::Said("What time should I remind you?".into())
+        );
+
+        let answered = service
+            .handle(OWNER, &chat(), "tomorrow at 9")
+            .await
+            .unwrap();
+        assert!(
+            matches!(answered, ReminderOutcome::Created(_)),
+            "{answered:?}"
+        );
+
+        // The second call carried the first exchange, which is why the answer resolved.
+        let second = &service.llm.requests()[1];
+        assert_eq!(second.messages.len(), 3, "user, assistant, user");
+        assert!(
+            matches!(&second.messages[1], Message::Assistant { content: Some(c), .. }
+                     if c == "What time should I remind you?")
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_conversations_do_not_see_each_other() {
+        let service = service(
+            ScriptedLlm::new()
+                .answering("What time?")
+                .answering("Still, what time?"),
+        );
+        service.handle(OWNER, &chat(), "remind me").await.unwrap();
+        service
+            .handle(OWNER, &ConversationId::new("elsewhere"), "remind me")
+            .await
+            .unwrap();
+
+        let second = &service.llm.requests()[1];
+        assert_eq!(second.messages.len(), 1, "a fresh conversation: {second:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_leaves_a_result_behind_so_the_next_turn_is_legal() {
+        // Every tool call needs exactly one result, or the next turn opens `tool -> user`
+        // and the provider rejects it (docs/reference-notes.md §3).
+        let service = service(extracting(monthly_invoice()));
+        create(&service, OWNER, "каждый месяц 20").await.unwrap();
+
+        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        assert!(stored.pending_tool_calls().is_empty(), "{stored:?}");
+        assert!(matches!(
+            stored.messages().last(),
+            Some(Message::Tool { .. })
+        ));
+        // And it is short: this rides along on every later turn.
+        let Some(Message::Tool { content, .. }) = stored.messages().last() else {
+            unreachable!()
+        };
+        assert!(
+            content.len() < 80,
+            "tool results are re-sent forever: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_never_reached_the_model_leaves_the_history_alone() {
+        let service = service(
+            ScriptedLlm::new()
+                .answering("hello")
+                .failing(LlmError::Transport("the provider is down".into())),
+        );
+        service.handle(OWNER, &chat(), "first").await.unwrap();
+        assert!(service.handle(OWNER, &chat(), "second").await.is_err());
+
+        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        assert_eq!(stored.len(), 2, "no orphaned user message: {stored:?}");
+    }
+
+    #[tokio::test]
+    async fn compacting_folds_the_history_into_a_summary_and_keeps_going() {
+        let service = service(
+            ScriptedLlm::new()
+                .answering("What time?")
+                .answering("Notes: they want a bank reminder, time still unknown."),
+        );
+        service
+            .handle(OWNER, &chat(), "remind me to call the bank")
+            .await
+            .unwrap();
+
+        assert!(service.compact_conversation(&chat()).await.unwrap());
+        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+
+        assert_eq!(stored.len(), 2, "a summary and an acknowledgement");
+        assert!(
+            format!("{:?}", stored.messages()).contains("time still unknown"),
+            "{stored:?}"
+        );
+        // Same conversation, so the cache-stable half is untouched.
+        assert_eq!(stored.system_prompt(), prompt::INSTRUCTIONS);
+        assert_eq!(stored.id(), &chat());
+        // And it can still take the next message.
+        assert_eq!(stored.tail(), serana_domain::Tail::Assistant);
+    }
+
+    #[tokio::test]
+    async fn compacting_an_untouched_conversation_says_there_was_nothing_to_do() {
+        let service = service(ScriptedLlm::new());
+        assert!(!service.compact_conversation(&chat()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_history_is_folded_up_once_the_provider_says_it_has_grown() {
+        let mut service = service(
+            ScriptedLlm::new()
+                .responding(CompletionResponse {
+                    content: Some("one".into()),
+                    tool_calls: Vec::new(),
+                    finish_reason: serana_domain::FinishReason::Stop,
+                    usage: Usage {
+                        prompt_tokens: 5_000,
+                        ..Usage::default()
+                    },
+                })
+                .answering("summary of everything"),
+        );
+        // Below the reported count, so the turn trips it.
+        service.config.compact_above_tokens = 1_000;
+
+        service.handle(OWNER, &chat(), "first").await.unwrap();
+        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        assert_eq!(stored.len(), 2, "folded up straight away: {stored:?}");
+        assert!(format!("{:?}", stored.messages()).contains("summary of everything"));
+    }
+
+    #[tokio::test]
     async fn updating_keeps_the_reminders_identity_and_history() {
         let service = service(extracting(monthly_invoice()));
         let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
@@ -459,10 +830,11 @@ mod tests {
             ),
             FixedClock::at("2026-03-10T06:00:00Z"),
             SequentialIds::default(),
+            InMemoryConversationRepository::new(),
             config(),
         );
         let outcome = service
-            .handle(OWNER, "make it the 20th to the 26th")
+            .handle(OWNER, &chat(), "make it the 20th to the 26th")
             .await
             .unwrap();
         let ReminderOutcome::Updated(updated) = outcome else {
@@ -588,34 +960,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_extraction_call_carries_the_current_local_time_and_offers_the_function() {
-        // Without the local time in the prompt, "tomorrow" cannot be resolved at all.
+    async fn the_turn_carries_the_local_time_on_the_message_not_the_system_prompt() {
         let service = service(extracting(monthly_invoice()));
         create(&service, OWNER, "каждый месяц 20 число")
             .await
             .unwrap();
 
         let request = &service.llm.requests()[0];
+
+        // The moment rides the user message. Putting it in the system prompt would change
+        // that prompt on every turn and cost the provider's prompt cache — the whole reason
+        // the two were split (docs/reference-notes.md §2).
+        let Message::User { content } = &request.messages[0] else {
+            panic!(
+                "the turn should open with a user message: {:?}",
+                request.messages
+            );
+        };
+        for fact in ["2026-03-10", "10:00", "Tuesday", "Asia/Tbilisi"] {
+            assert!(content.contains(fact), "{fact} missing from {content}");
+        }
         assert!(
-            request.system_prompt.contains("2026-03-10"),
-            "{}",
-            request.system_prompt
+            content.ends_with("каждый месяц 20 число"),
+            "the person's own words come last: {content}"
         );
-        assert!(
-            request.system_prompt.contains("10:00"),
-            "{}",
-            request.system_prompt
-        );
-        assert!(
-            request.system_prompt.contains("Tuesday"),
-            "{}",
-            request.system_prompt
-        );
-        assert!(
-            request.system_prompt.contains("Asia/Tbilisi"),
-            "{}",
-            request.system_prompt
-        );
+
+        for volatile in ["2026-03-10", "Tuesday"] {
+            assert!(
+                !request.system_prompt.contains(volatile),
+                "{volatile} must not be in the system prompt: {}",
+                request.system_prompt
+            );
+        }
+
         // Every action is offered on every turn: the model picks the verb, not the user.
         let offered: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
@@ -627,9 +1004,6 @@ mod tests {
                 tools::ACKNOWLEDGE
             ]
         );
-        // Temperature is asserted on its own, in
-        // `no_temperature_is_sent_unless_one_is_configured`: it is a per-model capability
-        // now, not a property of extraction.
         assert_eq!(request.model, "gpt-5-mini");
     }
 
@@ -654,7 +1028,10 @@ mod tests {
         // Prose is now an outcome, not a failure: it is how the model asks which of several
         // reminders was meant, and how it says what it still needs.
         let service = service(ScriptedLlm::new().answering("I need to know what time of day."));
-        let outcome = service.handle(OWNER, "напомни про invoice").await.unwrap();
+        let outcome = service
+            .handle(OWNER, &chat(), "напомни про invoice")
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             ReminderOutcome::Said("I need to know what time of day.".into())
@@ -666,7 +1043,7 @@ mod tests {
     async fn an_empty_prose_answer_still_produces_a_usable_message() {
         // A blank answer would otherwise reach the user as an empty message.
         let service = service(ScriptedLlm::new().answering("   "));
-        let outcome = service.handle(OWNER, "что-то").await.unwrap();
+        let outcome = service.handle(OWNER, &chat(), "что-то").await.unwrap();
         let ReminderOutcome::Said(message) = outcome else {
             panic!("expected prose, got {outcome:?}");
         };
