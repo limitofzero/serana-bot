@@ -1,7 +1,7 @@
 //! Delivering reminders over Telegram.
 
 use async_trait::async_trait;
-use serana_domain::reminder::{Notifier, NotifyError, UserId};
+use serana_domain::reminder::{Notifier, NotifyError, Reminder, UserId};
 use teloxide::prelude::*;
 use teloxide::{ApiError, RequestError};
 
@@ -22,12 +22,17 @@ impl TelegramNotifier {
 
 #[async_trait]
 impl Notifier for TelegramNotifier {
-    async fn notify(&self, owner: UserId, text: &str) -> Result<(), NotifyError> {
+    async fn notify(
+        &self,
+        owner: UserId,
+        reminder: &Reminder,
+        now: jiff::Timestamp,
+    ) -> Result<(), NotifyError> {
         // Presented, not passed through: a delivery arrives unprompted and has to read as a
         // reminder rather than as the assistant saying something. The wording lives in
         // `serana-app` with every other line the user sees.
         self.bot
-            .send_message(ChatId(owner.get()), serana_app::text::fired(text))
+            .send_message(ChatId(owner.get()), serana_app::text::fired(reminder, now))
             .await
             .map(|_| ())
             .map_err(classify)

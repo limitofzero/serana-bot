@@ -109,7 +109,17 @@ async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyh
         reply(&bot, &message, text::UNKNOWN_COMMAND.to_owned()).await;
         return Ok(());
     }
-    answer(bot, message, Command::Reminder(text), state).await
+    // A reply is how a person points at something. The message being replied to is very
+    // often a delivery the scheduler pushed, which never entered the conversation, so this
+    // is the only way the assistant can know what "this one" refers to.
+    let command = match message
+        .reply_to_message()
+        .and_then(|replied| replied.text())
+    {
+        Some(quoted) => Command::replying(quoted, &text),
+        None => Command::Reminder(text),
+    };
+    answer(bot, message, command, state).await
 }
 
 async fn dispatch(

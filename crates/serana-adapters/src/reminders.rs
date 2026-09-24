@@ -87,11 +87,15 @@ fn row_to_reminder(row: &sqlx::sqlite::SqliteRow) -> Result<Reminder, StorageErr
     let next_fire_at: Option<i64> = row.try_get("next_fire_at").map_err(backend)?;
     let last_fired_at: Option<i64> = row.try_get("last_fired_at").map_err(backend)?;
     let acknowledged_through: Option<i64> = row.try_get("acknowledged_through").map_err(backend)?;
+    let items: String = row.try_get("items").map_err(backend)?;
 
     Ok(Reminder {
         id: ReminderId::new(row.try_get::<String, _>("id").map_err(backend)?),
         owner: UserId::new(row.try_get::<i64, _>("owner").map_err(backend)?),
         text: row.try_get("text").map_err(backend)?,
+        items: serde_json::from_str(&items).map_err(|e| {
+            StorageError::Corrupt(format!("checklist {items:?} is not readable: {e}"))
+        })?,
         recurrence: serde_json::from_str::<Recurrence>(&recurrence).map_err(|e| {
             StorageError::Corrupt(format!("recurrence {recurrence:?} is not readable: {e}"))
         })?,
@@ -132,8 +136,8 @@ impl ReminderRepository for SqliteReminderRepository {
         sqlx::query(
             "INSERT INTO reminders
                  (id, owner, text, recurrence, timezone, created_at, next_fire_at,
-                  last_fired_at, acknowledged_through)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  last_fired_at, acknowledged_through, items)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  owner = excluded.owner,
                  text = excluded.text,
@@ -142,7 +146,8 @@ impl ReminderRepository for SqliteReminderRepository {
                  created_at = excluded.created_at,
                  next_fire_at = excluded.next_fire_at,
                  last_fired_at = excluded.last_fired_at,
-                 acknowledged_through = excluded.acknowledged_through",
+                 acknowledged_through = excluded.acknowledged_through,
+                 items = excluded.items",
         )
         .bind(reminder.id.as_str())
         .bind(reminder.owner.get())
@@ -153,6 +158,11 @@ impl ReminderRepository for SqliteReminderRepository {
         .bind(reminder.next_fire_at.map(to_nanos).transpose()?)
         .bind(reminder.last_fired_at.map(to_nanos).transpose()?)
         .bind(reminder.acknowledged_through.map(to_nanos).transpose()?)
+        .bind(
+            serde_json::to_string(&reminder.items).map_err(|e| {
+                StorageError::Backend(format!("checklist is not serialisable: {e}"))
+            })?,
+        )
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -213,6 +223,7 @@ mod tests {
             id: ReminderId::new(id),
             owner: UserId::new(owner),
             text: format!("reminder {id}"),
+            items: Vec::new(),
             recurrence: Recurrence::Monthly {
                 days: MonthDays::new([20]).unwrap(),
                 at: jiff::civil::time(10, 0, 0, 0),

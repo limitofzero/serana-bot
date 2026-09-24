@@ -360,6 +360,29 @@ impl Recurrence {
         starts.checked_sub(jiff::Span::new().nanoseconds(1)).ok()
     }
 
+    /// The first instant of the period containing `instant`, or `None` for a recurrence
+    /// with no periods.
+    ///
+    /// The mirror of [`Self::period_end_after`]. A checklist tick counts only if it landed
+    /// at or after this moment, which is what makes the list come back empty next period.
+    pub fn period_start_of(
+        &self,
+        instant: jiff::Timestamp,
+        tz: &jiff::tz::TimeZone,
+    ) -> Option<jiff::Timestamp> {
+        let date = instant.to_zoned(tz.clone()).date();
+        let starts = match self {
+            Self::Once { .. } => return None,
+            Self::Daily { .. } => date,
+            Self::Weekly { .. } => {
+                let back = i64::from(date.weekday().to_monday_zero_offset());
+                date.checked_sub(jiff::Span::new().days(back)).ok()?
+            }
+            Self::Monthly { .. } => date.first_of_month(),
+        };
+        to_instant(starts.to_datetime(jiff::civil::time(0, 0, 0, 0)), tz)
+    }
+
     /// Whether this recurrence can fire more than once.
     pub fn is_recurring(&self) -> bool {
         !matches!(self, Self::Once { .. })
@@ -382,6 +405,27 @@ fn candidate_after(
     (ts > after).then_some(ts)
 }
 
+/// One line of a reminder's checklist.
+///
+/// `done_at` is a moment rather than a flag, because a recurring checklist has to come back
+/// unticked next period. Whether it counts as done is therefore a question about *when* it
+/// was ticked, answered by [`Reminder::is_done`] — nothing ever has to reset it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub text: String,
+    #[serde(default)]
+    pub done_at: Option<jiff::Timestamp>,
+}
+
+impl TodoItem {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            done_at: None,
+        }
+    }
+}
+
 /// A scheduled reminder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reminder {
@@ -389,6 +433,10 @@ pub struct Reminder {
     pub owner: UserId,
     /// What to send. Stored as the user's own words.
     pub text: String,
+    /// The checklist, if there is one. Empty is the ordinary case: a reminder that is just
+    /// a message.
+    #[serde(default)]
+    pub items: Vec<TodoItem>,
     pub recurrence: Recurrence,
     pub timezone: TimeZoneName,
     pub created_at: jiff::Timestamp,
@@ -424,6 +472,116 @@ impl Reminder {
             .map_or(now, |through| now.max(through));
         self.next_fire_at = self.recurrence.next_occurrence_after(floor, &tz);
         Ok(self.next_fire_at)
+    }
+
+    /// The start of the period `now` falls in, or `None` if the recurrence has no periods.
+    fn period_start(&self, now: jiff::Timestamp) -> Result<Option<jiff::Timestamp>, StorageError> {
+        let tz = self.timezone.resolve()?;
+        Ok(self.recurrence.period_start_of(now, &tz))
+    }
+
+    /// Whether `item` counts as ticked for the period `now` falls in.
+    ///
+    /// A tick from a previous period does not count — that is the whole reason `done_at` is
+    /// a timestamp. A one-off has a single period stretching forever, so any tick counts.
+    pub fn is_done(&self, item: &TodoItem, now: jiff::Timestamp) -> Result<bool, StorageError> {
+        let Some(done_at) = item.done_at else {
+            return Ok(false);
+        };
+        Ok(match self.period_start(now)? {
+            Some(start) => done_at >= start,
+            None => true,
+        })
+    }
+
+    /// The items still outstanding this period, in order.
+    pub fn outstanding(&self, now: jiff::Timestamp) -> Result<Vec<&TodoItem>, StorageError> {
+        let mut left = Vec::new();
+        for item in &self.items {
+            if !self.is_done(item, now)? {
+                left.push(item);
+            }
+        }
+        Ok(left)
+    }
+
+    /// Whether every item has been ticked this period. False when there is no checklist —
+    /// an empty list is not "finished", it is a reminder that never had one.
+    pub fn all_done(&self, now: jiff::Timestamp) -> Result<bool, StorageError> {
+        if self.items.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.outstanding(now)?.is_empty())
+    }
+
+    /// Tick the items matching `wanted`, returning the text of each one actually ticked.
+    ///
+    /// Matching is forgiving because the phrases come from a model repeating the user back:
+    /// an exact match first, then a single unambiguous containment. An ambiguous phrase
+    /// ticks nothing, because ticking the wrong line is worse than ticking none.
+    pub fn complete(&mut self, wanted: &[String], now: jiff::Timestamp) -> Vec<String> {
+        let mut ticked = Vec::new();
+        for phrase in wanted {
+            let needle = phrase.trim().to_lowercase();
+            if needle.is_empty() {
+                continue;
+            }
+            let exact: Vec<usize> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.text.trim().to_lowercase() == needle)
+                .map(|(index, _)| index)
+                .collect();
+            let candidates = if exact.is_empty() {
+                self.items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        let text = item.text.to_lowercase();
+                        text.contains(&needle) || needle.contains(&text)
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            } else {
+                exact
+            };
+
+            if let [only] = candidates[..] {
+                self.items[only].done_at = Some(now);
+                ticked.push(self.items[only].text.clone());
+            }
+        }
+        ticked
+    }
+
+    /// Replace the checklist, keeping the ticks of any line that survives the edit.
+    ///
+    /// Adding a fourth thing to do should not un-tick the three already done. Lines are
+    /// matched by their text, which is the only identity a checklist item has — rename one
+    /// and it is a new line, which is the honest reading of a rename.
+    pub fn relist(&mut self, items: Vec<TodoItem>) {
+        let previous = std::mem::take(&mut self.items);
+        self.items = items
+            .into_iter()
+            .map(|mut item| {
+                if item.done_at.is_none() {
+                    let needle = item.text.trim().to_lowercase();
+                    item.done_at = previous
+                        .iter()
+                        .find(|old| old.text.trim().to_lowercase() == needle)
+                        .and_then(|old| old.done_at);
+                }
+                item
+            })
+            .collect();
+    }
+
+    /// Untick everything, so the checklist reads as fresh for the period.
+    pub fn reopen(&mut self) {
+        for item in &mut self.items {
+            item.done_at = None;
+        }
     }
 
     /// Record that the user has dealt with this period, and skip to the next one.
@@ -483,7 +641,21 @@ pub trait ReminderRepository: Send + Sync {
 /// Delivers a message to a user out of band — the push half of a reminder.
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    async fn notify(&self, owner: UserId, text: &str) -> Result<(), NotifyError>;
+    /// Deliver `reminder` to `owner`.
+    ///
+    /// Takes the whole reminder rather than a rendered string because what arrives depends
+    /// on it: a checklist shows what is still outstanding, a plain reminder shows its text.
+    /// Composing that sentence is the frontend's job, and the frontend is the only layer
+    /// that may read `serana-app`.
+    /// `now` decides which checklist items count as outstanding. It is passed in rather
+    /// than read from a clock here so that the whole tick — what is due, what is still
+    /// undone, what is recorded — is reasoned about at one instant.
+    async fn notify(
+        &self,
+        owner: UserId,
+        reminder: &Reminder,
+        now: jiff::Timestamp,
+    ) -> Result<(), NotifyError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -522,8 +694,13 @@ impl<T: ReminderRepository + ?Sized> ReminderRepository for Arc<T> {
 
 #[async_trait]
 impl<T: Notifier + ?Sized> Notifier for Arc<T> {
-    async fn notify(&self, owner: UserId, text: &str) -> Result<(), NotifyError> {
-        (**self).notify(owner, text).await
+    async fn notify(
+        &self,
+        owner: UserId,
+        reminder: &Reminder,
+        now: jiff::Timestamp,
+    ) -> Result<(), NotifyError> {
+        (**self).notify(owner, reminder, now).await
     }
 }
 
@@ -699,6 +876,7 @@ mod tests {
             id: ReminderId::new("r1"),
             owner: UserId::new(1),
             text: "issue the invoice".into(),
+            items: Vec::new(),
             recurrence: Recurrence::Monthly {
                 days: MonthDays::new([20, 21, 22, 23, 24, 25, 26]).unwrap(),
                 at: time(22, 30, 0, 0),
@@ -709,6 +887,144 @@ mod tests {
             last_fired_at: None,
             acknowledged_through: None,
         }
+    }
+
+    /// The payment checklist from the brief: days 1-6 each month, three things to do.
+    fn payment_checklist() -> Reminder {
+        let mut r = nagging();
+        r.text = "monthly payment".into();
+        r.recurrence = Recurrence::Monthly {
+            days: MonthDays::new([1, 2, 3, 4, 5, 6]).unwrap(),
+            at: time(9, 0, 0, 0),
+        };
+        r.items = vec![
+            TodoItem::new("exchange money"),
+            TodoItem::new("transfer to tbc"),
+            TodoItem::new("write to the banker"),
+        ];
+        r
+    }
+
+    #[test]
+    fn a_tick_counts_this_period_and_goes_stale_in_the_next() {
+        // The whole reason `done_at` is a timestamp rather than a flag.
+        let tz = tbilisi();
+        let mut r = payment_checklist();
+        let march = at(2026, 3, 2, 10, 0, &tz);
+        r.complete(&["exchange money".into()], march);
+
+        assert!(r.is_done(&r.items[0], march).unwrap(), "done in March");
+        assert_eq!(r.outstanding(march).unwrap().len(), 2);
+
+        // April: the same tick no longer counts, and nothing had to reset it.
+        let april = at(2026, 4, 1, 10, 0, &tz);
+        assert!(!r.is_done(&r.items[0], april).unwrap());
+        assert_eq!(r.outstanding(april).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_tick_earlier_in_the_same_period_still_counts() {
+        // Day 1 ticked, read back on day 6: the window is the month, not the day.
+        let tz = tbilisi();
+        let mut r = payment_checklist();
+        r.complete(&["exchange money".into()], at(2026, 3, 1, 10, 0, &tz));
+        assert!(
+            r.is_done(&r.items[0], at(2026, 3, 6, 23, 0, &tz)).unwrap(),
+            "still done on the 6th"
+        );
+    }
+
+    #[test]
+    fn matching_is_forgiving_but_refuses_to_guess_between_two_lines() {
+        let tz = tbilisi();
+        let now = at(2026, 3, 2, 10, 0, &tz);
+        let mut r = payment_checklist();
+
+        // Exact, and a paraphrase that contains only one line.
+        assert_eq!(
+            r.complete(&["EXCHANGE MONEY".into(), "transfer".into()], now),
+            vec!["exchange money", "transfer to tbc"]
+        );
+
+        // "to" appears in two remaining lines... and in none now, so nothing is ticked.
+        let mut fresh = payment_checklist();
+        assert!(fresh.complete(&["to".into()], now).is_empty(), "ambiguous");
+        assert_eq!(fresh.outstanding(now).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_phrase_matching_nothing_ticks_nothing() {
+        let tz = tbilisi();
+        let now = at(2026, 3, 2, 10, 0, &tz);
+        let mut r = payment_checklist();
+        assert!(
+            r.complete(&["feed the cat".into(), "  ".into()], now)
+                .is_empty()
+        );
+        assert_eq!(r.outstanding(now).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn all_done_is_false_for_a_reminder_with_no_checklist() {
+        // An empty list is not "finished" — it never had anything to finish.
+        let tz = tbilisi();
+        assert!(!nagging().all_done(at(2026, 3, 20, 23, 0, &tz)).unwrap());
+    }
+
+    #[test]
+    fn finishing_the_checklist_is_what_ends_the_period() {
+        let tz = tbilisi();
+        let mut r = payment_checklist();
+        r.reschedule(at(2026, 3, 1, 0, 0, &tz)).unwrap();
+
+        let now = at(2026, 3, 2, 10, 0, &tz);
+        r.complete(
+            &[
+                "exchange money".into(),
+                "transfer to tbc".into(),
+                "write to the banker".into(),
+            ],
+            now,
+        );
+        assert!(r.all_done(now).unwrap());
+
+        // Acknowledging on the strength of that skips days 3-6.
+        r.acknowledge(now).unwrap();
+        assert_eq!(
+            local(r.next_fire_at.unwrap(), &tz),
+            date(2026, 4, 1).at(9, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_period_start_is_the_mirror_of_its_end() {
+        let tz = tbilisi();
+        let noon = at(2026, 3, 11, 12, 0, &tz);
+        let start = |r: &Recurrence| local(r.period_start_of(noon, &tz).unwrap(), &tz).date();
+
+        // 2026-03-11 is a Wednesday, so its week began on Monday the 9th.
+        assert_eq!(
+            start(&Recurrence::Daily {
+                at: time(9, 0, 0, 0)
+            }),
+            date(2026, 3, 11)
+        );
+        assert_eq!(
+            start(&Recurrence::Weekly {
+                days: WeekDays::new([Weekday::Monday]).unwrap(),
+                at: time(9, 0, 0, 0)
+            }),
+            date(2026, 3, 9)
+        );
+        assert_eq!(start(&payment_checklist().recurrence), date(2026, 3, 1));
+        assert_eq!(
+            Recurrence::Once {
+                at: date(2026, 3, 20).at(9, 0, 0, 0)
+            }
+            .period_start_of(noon, &tz),
+            None,
+            "a one-off has no periods, so a tick never goes stale"
+        );
     }
 
     #[test]
@@ -954,6 +1270,7 @@ mod tests {
             id: ReminderId::new("r1"),
             owner: UserId::new(42),
             text: "оформить invoice".into(),
+            items: Vec::new(),
             recurrence,
             timezone: TimeZoneName::new("Asia/Tbilisi"),
             created_at: jiff::Timestamp::UNIX_EPOCH,

@@ -47,6 +47,11 @@ fn list(parts: &[String]) -> String {
     }
 }
 
+/// How a checklist line is marked. A tick for finished, a plain circle for not yet —
+/// deliberately not a cross, which reads as failed rather than outstanding.
+const DONE: &str = "✅";
+const PENDING: &str = "⚪";
+
 fn weekday_name(weekday: Weekday) -> &'static str {
     match weekday {
         Weekday::Monday => "Monday",
@@ -160,10 +165,11 @@ fn next_fire(reminder: &Reminder) -> String {
 ///
 /// The id goes last and unlabelled — it matters only when something has gone wrong, and a
 /// line of machine noise at the top pushes the schedule (the part worth checking) down.
-fn confirmation(badge: &str, reminder: &Reminder, when: &str) -> String {
+fn confirmation(badge: &str, reminder: &Reminder, when: &str, now: jiff::Timestamp) -> String {
     format!(
-        "{badge} {}\n\n🗓 {}\n⏰ {when} {}\n🆔 {}",
+        "{badge} {}\n{}\n🗓 {}\n⏰ {when} {}\n🆔 {}",
         reminder.text,
+        checklist(reminder, now),
         describe(&reminder.recurrence),
         next_fire(reminder),
         reminder.id
@@ -171,8 +177,8 @@ fn confirmation(badge: &str, reminder: &Reminder, when: &str) -> String {
 }
 
 /// Confirmation after creating a reminder.
-pub fn created(reminder: &Reminder) -> String {
-    confirmation("✅", reminder, "next")
+pub fn created(reminder: &Reminder, now: jiff::Timestamp) -> String {
+    confirmation("✅", reminder, "next", now)
 }
 
 /// One line per reminder.
@@ -200,18 +206,69 @@ pub fn listing(reminders: &[Reminder]) -> String {
     out
 }
 
+/// The id line, for anything the user might reply to or name next.
+///
+/// Omitted only when the reminder has just been removed: an id that resolves to nothing is
+/// worse than no id at all.
+fn trailer(reminder: &Reminder, removed: bool) -> String {
+    if removed {
+        String::new()
+    } else {
+        format!("\n🆔 {}", reminder.id)
+    }
+}
+
+/// Confirmation after ticking items off a checklist.
+///
+/// Shows the whole list, ticks and all, because the question in the user's mind is what is
+/// left. Anything the model failed to match is named rather than silently dropped — a line
+/// that did not get ticked is exactly the thing they need to know about.
+pub fn completed(reminder: &Reminder, ticked: &[String], now: jiff::Timestamp) -> String {
+    if reminder.all_done(now).unwrap_or(false) {
+        let removed = !reminder.recurrence.is_recurring();
+        return format!(
+            "✅ All done — {}\n{}\n{}{}",
+            reminder.text,
+            checklist(reminder, now),
+            finished(reminder),
+            trailer(reminder, removed)
+        );
+    }
+    let mut out = format!("{}\n{}", reminder.text, checklist(reminder, now));
+    if ticked.is_empty() {
+        out.push_str("\nNothing matched — say which line, as it is written above.");
+    }
+    // Still outstanding, so they will very likely reply to this message to tick the next
+    // line off. Without the id that reply is guesswork again.
+    out.push_str(&trailer(reminder, false));
+    out
+}
+
 /// Confirmation after marking a period done.
 ///
 /// It names the next firing time because that is the question the user actually has:
 /// not "did it register" but "when does this come back".
 pub fn acknowledged(reminder: &Reminder) -> String {
+    let removed = !reminder.recurrence.is_recurring();
+    format!(
+        "✔️ Done — {}\n\n{}{}",
+        reminder.text,
+        finished(reminder),
+        trailer(reminder, removed)
+    )
+}
+
+/// What became of a reminder whose work is finished.
+///
+/// A repeating one is only resting; a one-off is gone, and saying so matters — otherwise
+/// the user goes looking for it in `/reminders` and wonders where it went.
+fn finished(reminder: &Reminder) -> String {
+    if !reminder.recurrence.is_recurring() {
+        return "🗑 Removed — it was a one-off.".to_owned();
+    }
     match reminder.next_fire_at {
-        Some(_) => format!(
-            "✔️ Done — {}\n\n🔕 quiet until {}",
-            reminder.text,
-            next_fire(reminder)
-        ),
-        None => format!("✔️ Done — {}\n\nNothing further scheduled.", reminder.text),
+        Some(_) => format!("🔕 quiet until {}", next_fire(reminder)),
+        None => "Nothing further scheduled.".to_owned(),
     }
 }
 
@@ -219,16 +276,51 @@ pub fn acknowledged(reminder: &Reminder) -> String {
 ///
 /// The bell is the whole point: this message is unprompted, so it has to be recognisable as
 /// a reminder at a glance rather than read as the assistant talking.
-pub fn fired(text: &str) -> String {
-    format!("⏰ {text}")
+///
+/// A checklist shows only what is still outstanding. On the fourth day of a six-day window
+/// the two things already done are not news, and repeating them buries the one that is.
+pub fn fired(reminder: &Reminder, now: jiff::Timestamp) -> String {
+    let outstanding = reminder.outstanding(now).unwrap_or_default();
+    if outstanding.is_empty() {
+        return format!("⏰ {}\n🆔 {}", reminder.text, reminder.id);
+    }
+    let lines: Vec<String> = outstanding
+        .iter()
+        .map(|item| format!("{PENDING} {}", item.text))
+        .collect();
+    // The id is here so a reply can be resolved exactly. Two reminders worded the same way
+    // are indistinguishable from their text alone, and replying to one of them is the
+    // gesture most likely to be ambiguous.
+    format!(
+        "⏰ {}\n\n{}\n🆔 {}",
+        reminder.text,
+        lines.join("\n"),
+        reminder.id
+    )
+}
+
+/// The checklist in full, ticks and all. Used where the user asked to see it.
+fn checklist(reminder: &Reminder, now: jiff::Timestamp) -> String {
+    if reminder.items.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = reminder
+        .items
+        .iter()
+        .map(|item| {
+            let done = reminder.is_done(item, now).unwrap_or(false);
+            format!("{} {}", if done { DONE } else { PENDING }, item.text)
+        })
+        .collect();
+    format!("\n{}\n", lines.join("\n"))
 }
 
 pub fn deleted(reminder: &Reminder) -> String {
     format!("🗑 Deleted — {}", reminder.text)
 }
 
-pub fn updated(reminder: &Reminder) -> String {
-    confirmation("✏️ Updated —", reminder, "next")
+pub fn updated(reminder: &Reminder, now: jiff::Timestamp) -> String {
+    confirmation("✏️ Updated —", reminder, "next", now)
 }
 
 /// What to say after a reminder turn.
@@ -238,17 +330,24 @@ pub fn updated(reminder: &Reminder) -> String {
 /// that tells the user how to answer.
 pub fn outcome(outcome: &ReminderOutcome) -> String {
     match outcome {
-        ReminderOutcome::Created(reminder) => created(reminder),
-        ReminderOutcome::Updated(reminder) => updated(reminder),
+        ReminderOutcome::Created { reminder, at } => created(reminder, *at),
+        ReminderOutcome::Updated { reminder, at } => updated(reminder, *at),
         ReminderOutcome::Deleted(reminder) => deleted(reminder),
         ReminderOutcome::Acknowledged(reminder) => acknowledged(reminder),
+        ReminderOutcome::Completed {
+            reminder,
+            ticked,
+            at,
+        } => completed(reminder, ticked, *at),
         ReminderOutcome::Said(words) => words.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serana_domain::reminder::{MonthDays, ReminderId, TimeZoneName, UserId, WeekDays};
+    use serana_domain::reminder::{
+        MonthDays, ReminderId, TimeZoneName, TodoItem, UserId, WeekDays,
+    };
 
     use super::*;
 
@@ -259,6 +358,7 @@ mod tests {
             // Deliberately not English: the reminder text is the user's own words, and the
             // copy around it must not assume a script or a language.
             text: "оформить invoice".into(),
+            items: Vec::new(),
             recurrence,
             timezone: TimeZoneName::new("Asia/Tbilisi"),
             created_at: jiff::Timestamp::UNIX_EPOCH,
@@ -411,7 +511,7 @@ mod tests {
             },
             Some("2026-03-20T06:00:00Z"),
         );
-        let message = created(&r);
+        let message = created(&r, jiff::Timestamp::UNIX_EPOCH);
         assert!(message.contains("оформить invoice"), "{message}");
         assert!(
             message.contains("every month on the 20th at 10:00"),
@@ -433,9 +533,142 @@ mod tests {
             Some("2026-03-11T05:00:00Z"),
         );
         r.text = "写发票".into();
-        assert!(created(&r).contains("写发票"));
+        assert!(created(&r, jiff::Timestamp::UNIX_EPOCH).contains("写发票"));
         assert!(listing(std::slice::from_ref(&r)).contains("写发票"));
         assert!(deleted(&r).contains("写发票"));
+    }
+
+    #[test]
+    fn every_reply_about_a_living_reminder_carries_its_id() {
+        // Whatever the user is looking at, replying to it has to be enough to identify the
+        // reminder — two worded the same are otherwise indistinguishable.
+        let now = jiff::Timestamp::UNIX_EPOCH;
+        let mut r = reminder(
+            Recurrence::Monthly {
+                days: MonthDays::new([1, 2]).unwrap(),
+                at: jiff::civil::time(9, 0, 0, 0),
+            },
+            Some("2026-03-11T05:00:00Z"),
+        );
+        r.items = vec![TodoItem::new("one"), TodoItem::new("two")];
+
+        for (what, message) in [
+            ("created", created(&r, now)),
+            ("updated", updated(&r, now)),
+            ("fired", fired(&r, now)),
+            ("completed", completed(&r, &["one".into()], now)),
+            ("acknowledged", acknowledged(&r)),
+            ("listing", listing(std::slice::from_ref(&r))),
+        ] {
+            assert!(
+                message.contains("🆔 a3f9k2xy"),
+                "{what} has no id:\n{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_reminder_is_not_given_an_id_that_resolves_to_nothing() {
+        let now = jiff::Timestamp::UNIX_EPOCH;
+        let mut r = reminder(
+            Recurrence::Once {
+                at: jiff::civil::date(2026, 3, 15).at(9, 0, 0, 0),
+            },
+            None,
+        );
+        r.items = vec![TodoItem {
+            text: "one".into(),
+            done_at: Some(now),
+        }];
+
+        let message = completed(&r, &["one".into()], now);
+        assert!(message.contains("Removed"), "{message}");
+        assert!(!message.contains("🆔"), "{message}");
+        assert!(!acknowledged(&r).contains("🆔"), "{}", acknowledged(&r));
+    }
+
+    #[test]
+    fn a_delivery_carries_its_id_so_a_reply_can_be_resolved() {
+        // Two reminders worded the same are indistinguishable from their text, and a reply
+        // quotes text. The id is the only thing that tells them apart.
+        let mut r = reminder(
+            Recurrence::Daily {
+                at: jiff::civil::time(9, 0, 0, 0),
+            },
+            Some("2026-03-11T05:00:00Z"),
+        );
+        r.text = "mortgage".into();
+        r.items = vec![TodoItem::new("exchange money")];
+
+        let message = fired(&r, jiff::Timestamp::UNIX_EPOCH);
+        assert!(message.contains("a3f9k2xy"), "{message}");
+        assert!(message.contains("⚪ exchange money"), "{message}");
+
+        // And on a plain reminder too, where there is no checklist to hang it off.
+        r.items.clear();
+        assert!(fired(&r, jiff::Timestamp::UNIX_EPOCH).contains("a3f9k2xy"));
+    }
+
+    #[test]
+    fn a_confirmation_shows_the_checklist_it_just_set_up() {
+        // The bug this replaced: "Updated" with no sign of the list that was added, so
+        // there was no way to tell whether it had worked.
+        let mut r = reminder(
+            Recurrence::Monthly {
+                days: MonthDays::new([1, 2, 3]).unwrap(),
+                at: jiff::civil::time(12, 0, 0, 0),
+            },
+            Some("2026-04-01T08:00:00Z"),
+        );
+        r.text = "monthly payment".into();
+        r.items = vec![
+            TodoItem::new("exchange money"),
+            TodoItem::new("transfer to tbc"),
+        ];
+
+        let message = created(&r, jiff::Timestamp::UNIX_EPOCH);
+        assert!(message.contains("⚪ exchange money"), "{message}");
+        assert!(message.contains("⚪ transfer to tbc"), "{message}");
+        assert!(message.contains("monthly payment"), "{message}");
+    }
+
+    #[test]
+    fn a_confirmation_keeps_the_ticks_an_edit_preserved() {
+        let now = "2026-03-02T08:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        let mut r = reminder(
+            Recurrence::Monthly {
+                days: MonthDays::new([1, 2, 3]).unwrap(),
+                at: jiff::civil::time(12, 0, 0, 0),
+            },
+            Some("2026-03-03T08:00:00Z"),
+        );
+        r.items = vec![
+            TodoItem {
+                text: "exchange money".into(),
+                done_at: Some(now),
+            },
+            TodoItem::new("transfer to tbc"),
+        ];
+
+        let message = updated(&r, now);
+        assert!(message.contains("✅ exchange money"), "{message}");
+        assert!(message.contains("⚪ transfer to tbc"), "{message}");
+    }
+
+    #[test]
+    fn a_plain_reminder_gains_no_empty_checklist_block() {
+        let r = reminder(
+            Recurrence::Daily {
+                at: jiff::civil::time(9, 0, 0, 0),
+            },
+            Some("2026-03-11T05:00:00Z"),
+        );
+        let message = created(&r, jiff::Timestamp::UNIX_EPOCH);
+        assert!(!message.contains('⚪'), "{message}");
+        assert!(
+            !message.contains("\n\n\n"),
+            "no gap where the list would be: {message}"
+        );
     }
 
     #[test]
@@ -477,7 +710,7 @@ mod tests {
             },
             None,
         );
-        assert!(created(&r).contains("never"));
+        assert!(created(&r, jiff::Timestamp::UNIX_EPOCH).contains("never"));
     }
 
     #[test]
@@ -490,7 +723,7 @@ mod tests {
         );
         r.timezone = TimeZoneName::new("Mars/Olympus_Mons");
         assert!(
-            created(&r).contains("2026-03-11"),
+            created(&r, jiff::Timestamp::UNIX_EPOCH).contains("2026-03-11"),
             "falls back to the raw instant"
         );
     }

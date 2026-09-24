@@ -5,6 +5,10 @@
 //! command set, so the two frontends cannot drift apart.
 
 /// Something the user asked for.
+/// How much of a quoted message is worth carrying. A reply to a long checklist should not
+/// double the size of every turn.
+const QUOTE_LIMIT: usize = 280;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// Explain what the assistant can do.
@@ -22,9 +26,64 @@ pub enum Command {
     Compact,
 }
 
+impl Command {
+    /// A reminder request made as a reply to an earlier message.
+    ///
+    /// The quoted text is folded into the request rather than carried beside it, because
+    /// that is where the model needs it: "this one is done" is only answerable if what was
+    /// replied to is in front of it. A push from the scheduler never enters the
+    /// conversation, so replying to a delivered checklist is otherwise the one gesture the
+    /// assistant cannot follow.
+    pub fn replying(quoted: &str, request: &str) -> Self {
+        let quoted = quoted.trim();
+        if quoted.is_empty() {
+            return Self::Reminder(request.trim().to_owned());
+        }
+        let mut quoted: String = quoted.chars().take(QUOTE_LIMIT).collect();
+        if quoted.chars().count() == QUOTE_LIMIT {
+            quoted.push('…');
+        }
+        Self::Reminder(format!(
+            "[replying to this message of yours:\n{quoted}\n]\n{}",
+            request.trim()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_carries_what_it_replied_to() {
+        let Command::Reminder(request) = Command::replying(
+            "⏰ mortgage\n⚪ exchange money\n⚪ transfer to tbc",
+            "first one is done",
+        ) else {
+            panic!("a reply is a reminder request");
+        };
+        assert!(request.contains("exchange money"), "{request}");
+        assert!(request.ends_with("first one is done"), "{request}");
+    }
+
+    #[test]
+    fn a_reply_to_nothing_readable_is_an_ordinary_request() {
+        assert_eq!(
+            Command::replying("   ", "  set a reminder  "),
+            Command::Reminder("set a reminder".into())
+        );
+    }
+
+    #[test]
+    fn a_long_quote_is_trimmed_rather_than_riding_along_in_full() {
+        // It is re-sent with the turn; an unbounded quote is an unbounded bill.
+        let huge = "x".repeat(5_000);
+        let Command::Reminder(request) = Command::replying(&huge, "done") else {
+            unreachable!()
+        };
+        assert!(request.chars().count() < 400, "{}", request.chars().count());
+        assert!(request.contains('…'), "and says it was cut");
+    }
 
     #[test]
     fn commands_carrying_arguments_keep_them_verbatim() {

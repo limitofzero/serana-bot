@@ -9,7 +9,7 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use serana_domain::reminder::{InvalidDays, MonthDays, Recurrence, WeekDays, Weekday};
+use serana_domain::reminder::{InvalidDays, MonthDays, Recurrence, TodoItem, WeekDays, Weekday};
 
 use super::ReminderError;
 
@@ -36,8 +36,19 @@ pub(crate) struct ParsedReminder {
     /// Calendar date as `YYYY-MM-DD`. Required when `kind` is `once`, ignored otherwise.
     #[serde(default)]
     pub date: Option<String>,
-    /// What to send when the reminder fires, in the user's own words.
+    /// A SHORT heading, a few words, in the person's own language. Never a list: if what
+    /// they want is several separate things, those go in `items` and this becomes a name
+    /// for the group, such as "monthly payment" or "moving day". A comma-separated run of
+    /// tasks here is always wrong.
     pub text: String,
+    /// One entry per thing to do, each tickable on its own.
+    ///
+    /// Use this whenever what the person wants is more than one action — anything joined
+    /// by commas, by "and", or written as separate lines. "exchange money, transfer to
+    /// tbc, write to the banker" is three entries, never one heading. Leave it out only
+    /// when there is genuinely a single thing to do.
+    #[serde(default)]
+    pub items: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -77,9 +88,20 @@ impl From<ParsedWeekday> for Weekday {
 
 impl ParsedReminder {
     /// Validate and convert. The returned `String` is the reminder's own text.
-    pub(crate) fn into_recurrence(self) -> Result<(Recurrence, String), ReminderError> {
+    pub(crate) fn into_recurrence(
+        self,
+    ) -> Result<(Recurrence, String, Vec<TodoItem>), ReminderError> {
         let time = parse_time(&self.time)?;
         let text = self.text.trim().to_owned();
+        // Blank lines would render as empty checkboxes nobody can ever tick.
+        let items: Vec<TodoItem> = self
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .map(TodoItem::new)
+            .collect();
         if text.is_empty() {
             return Err(ReminderError::Unparsable("the reminder has no text".into()));
         }
@@ -121,7 +143,7 @@ impl ParsedReminder {
             }
         };
 
-        Ok((recurrence, text))
+        Ok((recurrence, text, items))
     }
 }
 
@@ -165,6 +187,7 @@ mod tests {
             time: "10:00".into(),
             weekdays: None,
             days_of_month: None,
+            items: None,
             date: None,
             text: "оформить invoice".into(),
         }
@@ -174,7 +197,7 @@ mod tests {
     fn the_brief_example_becomes_a_monthly_recurrence() {
         let mut p = parsed(ParsedKind::Monthly);
         p.days_of_month = Some(vec![20]);
-        let (recurrence, text) = p.into_recurrence().unwrap();
+        let (recurrence, text, _items) = p.into_recurrence().unwrap();
         assert_eq!(
             recurrence,
             Recurrence::Monthly {
@@ -187,7 +210,7 @@ mod tests {
 
     #[test]
     fn a_daily_reminder_needs_nothing_but_a_time() {
-        let (recurrence, _) = parsed(ParsedKind::Daily).into_recurrence().unwrap();
+        let (recurrence, _, _items) = parsed(ParsedKind::Daily).into_recurrence().unwrap();
         assert_eq!(
             recurrence,
             Recurrence::Daily {
@@ -200,7 +223,7 @@ mod tests {
     fn a_weekly_reminder_carries_its_weekday() {
         let mut p = parsed(ParsedKind::Weekly);
         p.weekdays = Some(vec![ParsedWeekday::Friday]);
-        let (recurrence, _) = p.into_recurrence().unwrap();
+        let (recurrence, _, _items) = p.into_recurrence().unwrap();
         assert_eq!(
             recurrence,
             Recurrence::Weekly {
@@ -214,7 +237,7 @@ mod tests {
     fn a_one_off_reminder_combines_its_date_and_time() {
         let mut p = parsed(ParsedKind::Once);
         p.date = Some("2026-03-20".into());
-        let (recurrence, _) = p.into_recurrence().unwrap();
+        let (recurrence, _, _items) = p.into_recurrence().unwrap();
         assert_eq!(
             recurrence,
             Recurrence::Once {

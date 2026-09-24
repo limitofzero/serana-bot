@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use serana_domain::reminder::{Notifier, NotifyError, UserId};
+use serana_domain::reminder::{Notifier, NotifyError, Reminder, UserId};
 
 /// Captures every delivery, and can be told to fail.
 pub struct RecordingNotifier {
@@ -71,7 +71,12 @@ impl RecordingNotifier {
 
 #[async_trait]
 impl Notifier for RecordingNotifier {
-    async fn notify(&self, owner: UserId, text: &str) -> Result<(), NotifyError> {
+    async fn notify(
+        &self,
+        owner: UserId,
+        reminder: &Reminder,
+        _now: jiff::Timestamp,
+    ) -> Result<(), NotifyError> {
         let permanent = self
             .failing
             .lock()
@@ -87,7 +92,9 @@ impl Notifier for RecordingNotifier {
                 self.delivered
                     .lock()
                     .expect("delivered mutex poisoned")
-                    .push((owner, text.to_owned()));
+                    // Recorded as the text alone: what a frontend renders around it is
+                    // presentation, and no service should be asserting on that.
+                    .push((owner, reminder.text.clone()));
                 Ok(())
             }
         }
@@ -96,14 +103,44 @@ impl Notifier for RecordingNotifier {
 
 #[cfg(test)]
 mod tests {
+    use serana_domain::reminder::{Recurrence, ReminderId, TimeZoneName};
+
+    /// A reminder whose text is `text`; the rest is scenery.
+    fn reminder(text: &str) -> Reminder {
+        Reminder {
+            id: ReminderId::new("r1"),
+            owner: UserId::new(1),
+            text: text.into(),
+            items: Vec::new(),
+            recurrence: Recurrence::Daily {
+                at: jiff::civil::time(9, 0, 0, 0),
+            },
+            timezone: TimeZoneName::new("Asia/Tbilisi"),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            next_fire_at: None,
+            last_fired_at: None,
+            acknowledged_through: None,
+        }
+    }
+
+    fn now() -> jiff::Timestamp {
+        jiff::Timestamp::UNIX_EPOCH
+    }
+
     use super::*;
 
     #[tokio::test]
     async fn deliveries_are_recorded_in_order() {
         let notifier = RecordingNotifier::new();
         assert!(notifier.is_empty());
-        notifier.notify(UserId::new(1), "first").await.unwrap();
-        notifier.notify(UserId::new(1), "second").await.unwrap();
+        notifier
+            .notify(UserId::new(1), &reminder("first"), now())
+            .await
+            .unwrap();
+        notifier
+            .notify(UserId::new(1), &reminder("second"), now())
+            .await
+            .unwrap();
         assert_eq!(
             notifier.messages_to(UserId::new(1)),
             vec!["first", "second"]
@@ -113,8 +150,14 @@ mod tests {
     #[tokio::test]
     async fn deliveries_are_separated_by_recipient() {
         let notifier = RecordingNotifier::new();
-        notifier.notify(UserId::new(1), "for one").await.unwrap();
-        notifier.notify(UserId::new(2), "for two").await.unwrap();
+        notifier
+            .notify(UserId::new(1), &reminder("for one"), now())
+            .await
+            .unwrap();
+        notifier
+            .notify(UserId::new(2), &reminder("for two"), now())
+            .await
+            .unwrap();
         assert_eq!(notifier.messages_to(UserId::new(1)), vec!["for one"]);
         assert_eq!(notifier.messages_to(UserId::new(2)), vec!["for two"]);
     }
@@ -122,7 +165,10 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_recipient_fails_permanently_and_records_nothing() {
         let notifier = RecordingNotifier::new().unreachable(UserId::new(1));
-        let err = notifier.notify(UserId::new(1), "hi").await.unwrap_err();
+        let err = notifier
+            .notify(UserId::new(1), &reminder("hi"), now())
+            .await
+            .unwrap_err();
         assert!(matches!(err, NotifyError::Unreachable(_)));
         assert!(notifier.is_empty());
     }
@@ -130,7 +176,10 @@ mod tests {
     #[tokio::test]
     async fn a_flaky_recipient_fails_transiently() {
         let notifier = RecordingNotifier::new().flaky(UserId::new(1));
-        let err = notifier.notify(UserId::new(1), "hi").await.unwrap_err();
+        let err = notifier
+            .notify(UserId::new(1), &reminder("hi"), now())
+            .await
+            .unwrap_err();
         assert!(matches!(err, NotifyError::Transport(_)));
     }
 }

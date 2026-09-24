@@ -53,7 +53,7 @@ where
         let mut report = TickReport::default();
 
         for mut reminder in self.repository.due_at(now).await? {
-            match self.notifier.notify(reminder.owner, &reminder.text).await {
+            match self.notifier.notify(reminder.owner, &reminder, now).await {
                 Ok(()) => {
                     if self.advance(&mut reminder, now).await? {
                         report.deactivated += 1;
@@ -159,6 +159,7 @@ mod tests {
             id: ReminderId::new(id),
             owner: OWNER,
             text: "оформить invoice".into(),
+            items: Vec::new(),
             recurrence,
             timezone: TimeZoneName::new("Asia/Tbilisi"),
             created_at: ts("2026-03-01T00:00:00Z"),

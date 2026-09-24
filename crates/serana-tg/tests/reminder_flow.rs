@@ -277,6 +277,7 @@ async fn the_model_is_asked_in_the_wire_format_it_expects() {
             "create_reminder",
             "update_reminder",
             "delete_reminder",
+            "complete_items",
             "acknowledge_reminder"
         ]
     );

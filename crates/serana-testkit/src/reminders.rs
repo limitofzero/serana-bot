@@ -118,6 +118,7 @@ mod tests {
             id: ReminderId::new(id),
             owner: UserId::new(owner),
             text: format!("reminder {id}"),
+            items: Vec::new(),
             recurrence: Recurrence::Daily {
                 at: jiff::civil::time(10, 0, 0, 0),
             },

@@ -15,6 +15,7 @@ pub(crate) const CREATE: &str = "create_reminder";
 pub(crate) const UPDATE: &str = "update_reminder";
 pub(crate) const DELETE: &str = "delete_reminder";
 pub(crate) const ACKNOWLEDGE: &str = "acknowledge_reminder";
+pub(crate) const COMPLETE: &str = "complete_items";
 
 /// Changing a reminder means restating its whole schedule, not patching one field.
 ///
@@ -30,6 +31,15 @@ pub(crate) struct UpdateArgs {
     /// The complete new schedule and text, including the parts that are not changing.
     #[serde(flatten)]
     pub schedule: ParsedReminder,
+}
+
+/// Ticking lines off a reminder's checklist.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct CompleteArgs {
+    /// The id of the reminder whose checklist this is, copied exactly from the context.
+    pub id: String,
+    /// The lines the person has finished, copied from the checklist as closely as you can.
+    pub items: Vec<String>,
 }
 
 /// Arguments for the two actions that only need to name a reminder.
@@ -59,6 +69,12 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
             "Delete an existing reminder for good. Only call this when the person clearly \
              means to remove it, and only with an id you were given.",
         ),
+        ToolSpec::typed::<CompleteArgs>(
+            COMPLETE,
+            "Tick items off a reminder's checklist. Use this when the person says they have \
+             finished some of the things on it, not all of it — when the last item is \
+             ticked the reminder falls quiet for the period on its own.",
+        ),
         ToolSpec::typed::<TargetArgs>(
             ACKNOWLEDGE,
             "Mark an existing reminder as dealt with for the current period. It stops firing \
@@ -70,7 +86,7 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
 
 /// Whether `name` is one of ours, so a hallucinated tool name is not dispatched.
 pub(crate) fn is_known(name: &str) -> bool {
-    matches!(name, CREATE | UPDATE | DELETE | ACKNOWLEDGE)
+    matches!(name, CREATE | UPDATE | DELETE | ACKNOWLEDGE | COMPLETE)
 }
 
 #[cfg(test)]
@@ -80,7 +96,7 @@ mod tests {
     #[test]
     fn every_tool_is_offered_and_recognised() {
         let specs = specs();
-        assert_eq!(specs.len(), 4);
+        assert_eq!(specs.len(), 5);
         for spec in &specs {
             assert!(
                 is_known(&spec.name),
@@ -107,7 +123,7 @@ mod tests {
             .find(|spec| spec.name == UPDATE)
             .unwrap();
         let properties = spec.parameters["properties"].as_object().unwrap();
-        for field in ["id", "kind", "time", "text"] {
+        for field in ["id", "kind", "time", "text", "items"] {
             assert!(
                 properties.contains_key(field),
                 "{field} missing from {properties:?}"

@@ -60,6 +60,9 @@ fn render_error(error: &ReminderError) -> String {
     match error {
         ReminderError::Unparsable(reason) => format!("I did not understand: {reason}"),
         ReminderError::NeverFires => "That schedule would never fire — check the date.".to_owned(),
+        ReminderError::NoChecklist(id) => {
+            format!("Reminder {id} is a plain reminder — there is no checklist to tick.")
+        }
         ReminderError::NotFound(id) => {
             format!("No reminder with id {id}. See yours with /reminders")
         }
@@ -291,6 +294,119 @@ mod tests {
         assert!(reply.contains("Deleted"), "{reply}");
         assert!(reply.contains("оформить invoice"), "{reply}");
         assert!(service.list(OWNER).await.unwrap().is_empty(), "it is gone");
+    }
+
+    #[tokio::test]
+    async fn a_checklist_is_created_and_ticked_off_line_by_line() {
+        let service = service(
+            ScriptedLlm::new()
+                .calling(vec![ToolCall::new(
+                    "call_0",
+                    "create_reminder",
+                    serde_json::json!({
+                        "kind": "monthly", "time": "09:00", "days_of_month": [1, 2, 3, 4, 5, 6],
+                        "text": "monthly payment",
+                        "items": ["exchange money", "transfer to tbc", "write to the banker"]
+                    })
+                    .to_string(),
+                )])
+                .calling(vec![ToolCall::new(
+                    "call_1",
+                    "complete_items",
+                    serde_json::json!({ "id": FIRST_ID, "items": ["exchange money"] }).to_string(),
+                )]),
+        );
+
+        let created = respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("pay every month, 1st to 6th".into()),
+        )
+        .await;
+        assert!(created.contains("monthly payment"), "{created}");
+
+        let ticked = respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("exchanged the money".into()),
+        )
+        .await;
+        assert!(ticked.contains("✅ exchange money"), "{ticked}");
+        assert!(ticked.contains("⚪ transfer to tbc"), "{ticked}");
+        assert!(ticked.contains("⚪ write to the banker"), "{ticked}");
+    }
+
+    #[tokio::test]
+    async fn ticking_the_last_line_ends_the_period_by_itself() {
+        let service = service(
+            ScriptedLlm::new()
+                .calling(vec![ToolCall::new(
+                    "call_0",
+                    "create_reminder",
+                    serde_json::json!({
+                        "kind": "monthly", "time": "09:00", "days_of_month": [1, 2, 3],
+                        "text": "monthly payment",
+                        "items": ["exchange money", "transfer to tbc"]
+                    })
+                    .to_string(),
+                )])
+                .calling(vec![ToolCall::new(
+                    "call_1",
+                    "complete_items",
+                    serde_json::json!({
+                        "id": FIRST_ID, "items": ["exchange money", "transfer to tbc"]
+                    })
+                    .to_string(),
+                )]),
+        );
+        respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("pay monthly".into()),
+        )
+        .await;
+
+        let done = respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("did both of them".into()),
+        )
+        .await;
+        assert!(done.contains("All done"), "{done}");
+        assert!(done.contains("quiet until"), "{done}");
+
+        // Still there, just silent for the rest of this period.
+        let stored = service.list(OWNER).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].acknowledged_through.is_some());
+    }
+
+    #[tokio::test]
+    async fn ticking_a_line_on_a_reminder_with_no_checklist_says_so() {
+        let service = service(create_then(
+            "complete_items",
+            serde_json::json!({ "id": FIRST_ID, "items": ["something"] }),
+        ));
+        respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("каждый месяц 20".into()),
+        )
+        .await;
+
+        let reply = respond(
+            &service,
+            OWNER,
+            &chat(),
+            &Command::Reminder("done with it".into()),
+        )
+        .await;
+        assert!(reply.contains("no checklist"), "{reply}");
     }
 
     #[tokio::test]

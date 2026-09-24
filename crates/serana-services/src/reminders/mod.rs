@@ -12,7 +12,7 @@ use serana_domain::conversation_store::ConversationRepository;
 use serana_domain::llm::{CompletionRequest, CompletionResponse, LlmProvider};
 use serana_domain::message::Message;
 use serana_domain::reminder::{
-    Recurrence, Reminder, ReminderId, ReminderRepository, TimeZoneName, UserId,
+    Recurrence, Reminder, ReminderId, ReminderRepository, TimeZoneName, TodoItem, UserId,
 };
 use serana_domain::{Clock, IdGenerator, LlmError, StorageError};
 
@@ -30,10 +30,29 @@ impl ReminderConfig {
 /// What one reminder turn did, so the frontend can say so without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReminderOutcome {
-    Created(Reminder),
-    Updated(Reminder),
+    /// `at` is the moment the turn ran. Carried so whatever renders the checklist decides
+    /// what is ticked at the same instant the service did, rather than reading a clock of
+    /// its own and disagreeing across a period boundary.
+    Created {
+        reminder: Reminder,
+        at: jiff::Timestamp,
+    },
+    Updated {
+        reminder: Reminder,
+        at: jiff::Timestamp,
+    },
     Deleted(Reminder),
     Acknowledged(Reminder),
+    /// Items ticked off a checklist. Carries what was ticked, because a model paraphrasing
+    /// the person can miss a line and the user needs to see which ones landed.
+    Completed {
+        reminder: Reminder,
+        ticked: Vec<String>,
+        /// The moment the ticking happened. Carried so whatever renders the checklist uses
+        /// the same instant that decided what counts as done, instead of reading a clock of
+        /// its own and disagreeing across a period boundary.
+        at: jiff::Timestamp,
+    },
     /// The model answered in prose instead of acting: a question back to the user when
     /// several reminders matched, or an explanation of what it could not work out. Shown
     /// verbatim, because it is the only thing that tells the user how to rephrase.
@@ -54,6 +73,10 @@ pub enum ReminderError {
 
     #[error("no reminder with id {0}")]
     NotFound(ReminderId),
+
+    /// Asked to tick something off a reminder that has no checklist.
+    #[error("reminder {0} has no checklist")]
+    NoChecklist(ReminderId),
 
     #[error(transparent)]
     Llm(#[from] LlmError),
@@ -96,10 +119,16 @@ pub struct ReminderConfig {
 /// paid for over and over. The id and the verb are what a follow-up needs.
 fn summarise(outcome: &ReminderOutcome) -> String {
     let (verb, reminder) = match outcome {
-        ReminderOutcome::Created(r) => ("created", r),
-        ReminderOutcome::Updated(r) => ("updated", r),
+        ReminderOutcome::Created { reminder, .. } => ("created", reminder),
+        ReminderOutcome::Updated { reminder, .. } => ("updated", reminder),
         ReminderOutcome::Deleted(r) => ("deleted", r),
         ReminderOutcome::Acknowledged(r) => ("acknowledged", r),
+        ReminderOutcome::Completed {
+            reminder, ticked, ..
+        } => {
+            return serde_json::json!({ "ok": "ticked", "id": reminder.id.as_str(), "items": ticked })
+                .to_string();
+        }
         ReminderOutcome::Said(words) => return words.clone(),
     };
     serde_json::json!({ "ok": verb, "id": reminder.id.as_str() }).to_string()
@@ -174,7 +203,7 @@ where
         history
             .push_user(format!(
                 "{}\n{request}",
-                prompt::context(&local, &timezone, &existing)
+                prompt::context(&local, &timezone, &existing, now)
             ))
             .map_err(|e| ReminderError::Storage(StorageError::Corrupt(e.to_string())))?;
 
@@ -368,26 +397,31 @@ where
             tools::CREATE => {
                 let parsed: ParsedReminder =
                     serde_json::from_value(arguments).map_err(incomplete)?;
-                let (recurrence, text) = parsed.into_recurrence()?;
-                Ok(ReminderOutcome::Created(
-                    self.create(owner, now, timezone.clone(), recurrence, text)
+                let (recurrence, text, items) = parsed.into_recurrence()?;
+                Ok(ReminderOutcome::Created {
+                    reminder: self
+                        .create(owner, now, timezone.clone(), recurrence, text, items)
                         .await?,
-                ))
+                    at: now,
+                })
             }
             tools::UPDATE => {
                 let args: tools::UpdateArgs =
                     serde_json::from_value(arguments).map_err(incomplete)?;
-                let (recurrence, text) = args.schedule.into_recurrence()?;
-                Ok(ReminderOutcome::Updated(
-                    self.update(
-                        owner,
-                        &ReminderId::new(args.id.trim()),
-                        recurrence,
-                        text,
-                        now,
-                    )
-                    .await?,
-                ))
+                let (recurrence, text, items) = args.schedule.into_recurrence()?;
+                Ok(ReminderOutcome::Updated {
+                    reminder: self
+                        .update(
+                            owner,
+                            &ReminderId::new(args.id.trim()),
+                            recurrence,
+                            text,
+                            items,
+                            now,
+                        )
+                        .await?,
+                    at: now,
+                })
             }
             tools::DELETE => {
                 let args: tools::TargetArgs =
@@ -395,6 +429,18 @@ where
                 Ok(ReminderOutcome::Deleted(
                     self.delete(owner, &ReminderId::new(args.id.trim())).await?,
                 ))
+            }
+            tools::COMPLETE => {
+                let args: tools::CompleteArgs =
+                    serde_json::from_value(arguments).map_err(incomplete)?;
+                let (reminder, ticked) = self
+                    .complete_items(owner, &ReminderId::new(args.id.trim()), &args.items, now)
+                    .await?;
+                Ok(ReminderOutcome::Completed {
+                    reminder,
+                    ticked,
+                    at: now,
+                })
             }
             tools::ACKNOWLEDGE => {
                 let args: tools::TargetArgs =
@@ -419,11 +465,13 @@ where
         timezone: TimeZoneName,
         recurrence: Recurrence,
         text: String,
+        items: Vec<TodoItem>,
     ) -> Result<Reminder, ReminderError> {
         let mut reminder = Reminder {
             id: ReminderId::new(self.ids.generate()),
             owner,
             text,
+            items,
             recurrence,
             timezone,
             created_at: now,
@@ -454,6 +502,7 @@ where
         id: &ReminderId,
         recurrence: Recurrence,
         text: String,
+        items: Vec<TodoItem>,
         now: jiff::Timestamp,
     ) -> Result<Reminder, ReminderError> {
         let mut reminder = self
@@ -463,11 +512,24 @@ where
             .filter(|reminder| reminder.owner == owner)
             .ok_or_else(|| ReminderError::NotFound(id.clone()))?;
 
+        // A reminder that was already spent cannot be made worse by an edit. Refusing one
+        // would freeze it: a one-off whose moment has passed could never be given a
+        // checklist, renamed, or turned into a repeating reminder — only deleted.
+        let was_spent = !reminder.is_active();
+
         reminder.recurrence = recurrence;
         reminder.text = text;
+        reminder.relist(items);
         reminder.acknowledged_through = None;
-        if reminder.reschedule(now)?.is_none() {
+        if reminder.reschedule(now)?.is_none() && !was_spent {
             return Err(ReminderError::NeverFires);
+        }
+
+        // Clearing the acknowledgement above is the safe default for a changed schedule,
+        // but it must not resurrect a checklist that is still finished — editing a typo
+        // should not start the nagging again.
+        if reminder.all_done(now)? {
+            reminder.acknowledge(now)?;
         }
 
         self.repository.put(&reminder).await?;
@@ -496,9 +558,60 @@ where
             .filter(|reminder| reminder.owner == owner)
             .ok_or_else(|| ReminderError::NotFound(id.clone()))?;
 
-        reminder.acknowledge(self.clock.now())?;
-        self.repository.put(&reminder).await?;
+        self.retire(&mut reminder, self.clock.now()).await?;
         Ok(reminder)
+    }
+
+    /// The reminder's work for this period is finished. Put it away accordingly.
+    ///
+    /// A repeating reminder falls quiet until its next period and stays on the list — it
+    /// has more to do later. A one-off has nothing left to come back for, so keeping it
+    /// would leave a row that can never fire again cluttering every listing. It is deleted.
+    async fn retire(
+        &self,
+        reminder: &mut Reminder,
+        now: jiff::Timestamp,
+    ) -> Result<(), ReminderError> {
+        if reminder.recurrence.is_recurring() {
+            reminder.acknowledge(now)?;
+            self.repository.put(reminder).await?;
+        } else {
+            reminder.next_fire_at = None;
+            self.repository.delete(&reminder.id).await?;
+        }
+        Ok(())
+    }
+
+    /// Tick items off a reminder's checklist.
+    ///
+    /// Ticking the last outstanding item acknowledges the period: the job is done, so the
+    /// remaining days of the window have nothing left to nag about. That is the same thing
+    /// [`Self::acknowledge`] does, reached by finishing the work rather than by saying so.
+    pub async fn complete_items(
+        &self,
+        owner: UserId,
+        id: &ReminderId,
+        items: &[String],
+        now: jiff::Timestamp,
+    ) -> Result<(Reminder, Vec<String>), ReminderError> {
+        let mut reminder = self
+            .repository
+            .get(id)
+            .await?
+            .filter(|reminder| reminder.owner == owner)
+            .ok_or_else(|| ReminderError::NotFound(id.clone()))?;
+
+        if reminder.items.is_empty() {
+            return Err(ReminderError::NoChecklist(id.clone()));
+        }
+
+        let ticked = reminder.complete(items, now);
+        if reminder.all_done(now)? {
+            self.retire(&mut reminder, now).await?;
+        } else {
+            self.repository.put(&reminder).await?;
+        }
+        Ok((reminder, ticked))
     }
 
     /// Cancel one of `owner`'s reminders.
@@ -585,7 +698,7 @@ mod tests {
         request: &str,
     ) -> Result<Reminder, ReminderError> {
         match service.handle(owner, &chat(), request).await? {
-            ReminderOutcome::Created(reminder) => Ok(reminder),
+            ReminderOutcome::Created { reminder, .. } => Ok(reminder),
             other => panic!("expected a creation, got {other:?}"),
         }
     }
@@ -688,7 +801,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(answered, ReminderOutcome::Created(_)),
+            matches!(answered, ReminderOutcome::Created { .. }),
             "{answered:?}"
         );
 
@@ -837,7 +950,10 @@ mod tests {
             .handle(OWNER, &chat(), "make it the 20th to the 26th")
             .await
             .unwrap();
-        let ReminderOutcome::Updated(updated) = outcome else {
+        let ReminderOutcome::Updated {
+            reminder: updated, ..
+        } = outcome
+        else {
             panic!("expected an update, got {outcome:?}");
         };
 
@@ -858,6 +974,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spent_one_off_can_still_be_edited() {
+        // Its moment has passed, so rescheduling finds nothing — but refusing the edit
+        // would leave it frozen, editable only by deletion.
+        let service = service(extracting(serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15", "text": "call the bank"
+        })));
+        let created = create(&service, OWNER, "call the bank on the 15th")
+            .await
+            .unwrap();
+        assert!(created.is_active());
+
+        // Deliver it. A one-off has nothing after that, so it goes spent — exactly the
+        // state a reminder is in the morning after it fired.
+        let later = "2026-03-20T06:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        let mut spent = created.clone();
+        spent.mark_fired(later).unwrap();
+        assert!(!spent.is_active(), "nothing left to fire");
+        service.repository.put(&spent).await.unwrap();
+
+        let updated = service
+            .update(
+                OWNER,
+                &created.id,
+                created.recurrence.clone(),
+                "call the bank".into(),
+                vec![TodoItem::new("find the number"), TodoItem::new("call")],
+                later,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.items.len(), 2, "the checklist was added");
+        assert!(!updated.is_active(), "still spent, which is honest");
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_would_kill_a_live_reminder_is_still_refused() {
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
+        assert!(created.is_active());
+
+        let now = FixedClock::at("2026-03-10T06:00:00Z").now();
+        let result = service
+            .update(
+                OWNER,
+                &created.id,
+                Recurrence::Once {
+                    at: jiff::civil::date(2020, 1, 1).at(9, 0, 0, 0),
+                },
+                "оформить invoice".into(),
+                Vec::new(),
+                now,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ReminderError::NeverFires)),
+            "{result:?}"
+        );
+        let stored = service.repository.get(&created.id).await.unwrap().unwrap();
+        assert!(stored.is_active(), "left exactly as it was");
+    }
+
+    #[tokio::test]
+    async fn a_plain_reminder_can_be_turned_into_a_checklist() {
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
+        assert!(created.items.is_empty(), "starts as a plain reminder");
+
+        let service = Service::new(
+            service.repository,
+            calling(
+                tools::UPDATE,
+                serde_json::json!({
+                    "id": created.id.as_str(), "kind": "monthly", "time": "10:00",
+                    "days_of_month": [20], "text": "оформить invoice",
+                    "items": ["exchange money", "transfer to tbc"]
+                }),
+            ),
+            FixedClock::at("2026-03-10T06:00:00Z"),
+            SequentialIds::default(),
+            InMemoryConversationRepository::new(),
+            config(),
+        );
+        let outcome = service
+            .handle(OWNER, &chat(), "make that a checklist")
+            .await
+            .unwrap();
+        let ReminderOutcome::Updated {
+            reminder: updated, ..
+        } = outcome
+        else {
+            panic!("expected an update, got {outcome:?}");
+        };
+
+        assert_eq!(updated.id, created.id, "same reminder");
+        assert_eq!(updated.items.len(), 2);
+        assert_eq!(updated.items[0].text, "exchange money");
+    }
+
+    #[tokio::test]
+    async fn adding_a_line_does_not_untick_the_ones_already_done() {
+        let service = service(extracting(serde_json::json!({
+            "kind": "monthly", "time": "09:00", "days_of_month": [1, 2, 3],
+            "text": "monthly payment", "items": ["exchange money", "transfer to tbc"]
+        })));
+        let created = create(&service, OWNER, "pay monthly").await.unwrap();
+        let now = FixedClock::at("2026-03-10T06:00:00Z").now();
+
+        service
+            .complete_items(OWNER, &created.id, &["exchange money".into()], now)
+            .await
+            .unwrap();
+
+        let updated = service
+            .update(
+                OWNER,
+                &created.id,
+                created.recurrence.clone(),
+                "monthly payment".into(),
+                vec![
+                    TodoItem::new("exchange money"),
+                    TodoItem::new("transfer to tbc"),
+                    TodoItem::new("call the accountant"),
+                ],
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.items.len(), 3);
+        assert!(
+            updated.is_done(&updated.items[0], now).unwrap(),
+            "the tick survived the edit"
+        );
+        assert_eq!(updated.outstanding(now).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn editing_a_finished_checklist_does_not_start_it_nagging_again() {
+        let service = service(extracting(serde_json::json!({
+            "kind": "monthly", "time": "09:00", "days_of_month": [1, 2, 3],
+            "text": "monthly payment", "items": ["exchange money"]
+        })));
+        let created = create(&service, OWNER, "pay monthly").await.unwrap();
+        let now = FixedClock::at("2026-03-10T06:00:00Z").now();
+        service
+            .complete_items(OWNER, &created.id, &["exchange money".into()], now)
+            .await
+            .unwrap();
+
+        // Fixing the heading must not resurrect a period that is already finished.
+        let updated = service
+            .update(
+                OWNER,
+                &created.id,
+                created.recurrence.clone(),
+                "monthly payment (TBC)".into(),
+                vec![TodoItem::new("exchange money")],
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(updated.all_done(now).unwrap());
+        assert!(updated.acknowledged_through.is_some(), "still quiet");
+    }
+
+    #[tokio::test]
     async fn updating_clears_an_outstanding_acknowledgement() {
         // The new schedule may divide time into different periods, so a watermark from the
         // old one could silence days the user has just asked for.
@@ -874,6 +1158,7 @@ mod tests {
                     at: jiff::civil::time(9, 0, 0, 0),
                 },
                 "оформить invoice".into(),
+                Vec::new(),
                 FixedClock::at("2026-03-10T06:00:00Z").now(),
             )
             .await
@@ -908,6 +1193,83 @@ mod tests {
             service.repository.get(&created.id).await.unwrap().is_some(),
             "still stored"
         );
+    }
+
+    #[tokio::test]
+    async fn finishing_a_one_off_removes_it_rather_than_leaving_a_tombstone() {
+        // A spent one-off can never fire again, so keeping the row would only clutter
+        // every listing from then on.
+        let service = service(extracting(serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15",
+            "text": "call the bank"
+        })));
+        let created = create(&service, OWNER, "call the bank on the 15th")
+            .await
+            .unwrap();
+
+        let acked = service.acknowledge(OWNER, &created.id).await.unwrap();
+        assert!(!acked.recurrence.is_recurring());
+        assert!(
+            service.repository.get(&created.id).await.unwrap().is_none(),
+            "gone from storage"
+        );
+        assert!(service.list(OWNER).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finishing_a_repeating_reminder_keeps_it_for_next_time() {
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
+
+        service.acknowledge(OWNER, &created.id).await.unwrap();
+        let stored = service.repository.get(&created.id).await.unwrap().unwrap();
+        assert!(stored.is_active(), "it comes back next period");
+        assert!(stored.acknowledged_through.is_some());
+    }
+
+    #[tokio::test]
+    async fn ticking_the_last_item_of_a_one_off_checklist_removes_it_too() {
+        let service = service(extracting(serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15",
+            "text": "moving day", "items": ["pack", "hire a van"]
+        })));
+        let created = create(&service, OWNER, "moving day on the 15th")
+            .await
+            .unwrap();
+        let now = FixedClock::at("2026-03-10T06:00:00Z").now();
+
+        let (_, ticked) = service
+            .complete_items(
+                OWNER,
+                &created.id,
+                &["pack".into(), "hire a van".into()],
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ticked.len(), 2);
+        assert!(
+            service.repository.get(&created.id).await.unwrap().is_none(),
+            "the last tick finished it for good"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticking_only_some_items_leaves_the_reminder_alone() {
+        let service = service(extracting(serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15",
+            "text": "moving day", "items": ["pack", "hire a van"]
+        })));
+        let created = create(&service, OWNER, "moving day").await.unwrap();
+        let now = FixedClock::at("2026-03-10T06:00:00Z").now();
+
+        service
+            .complete_items(OWNER, &created.id, &["pack".into()], now)
+            .await
+            .unwrap();
+        let stored = service.repository.get(&created.id).await.unwrap().unwrap();
+        assert!(stored.is_active(), "one item left, so it still fires");
+        assert_eq!(stored.outstanding(now).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1001,6 +1363,7 @@ mod tests {
                 tools::CREATE,
                 tools::UPDATE,
                 tools::DELETE,
+                tools::COMPLETE,
                 tools::ACKNOWLEDGE
             ]
         );
