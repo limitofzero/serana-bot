@@ -49,8 +49,8 @@ Approved stack — reach for these before looking further:
 | Serialization | `serde`, `serde_json` |
 | JSON Schema from Rust types | `schemars` — **never hand-write a tool schema** |
 | Async traits | `async-trait` |
-| Errors (libraries) | `thiserror` |
-| Errors (binaries) | `anyhow` |
+| Errors a caller branches on | `thiserror` |
+| Errors that are only reported | `anyhow` |
 | Logging | `tracing`, `tracing-subscriber` |
 | Retry / backoff | `backon` |
 | Dates & time | `jiff` |
@@ -108,17 +108,72 @@ parser.
 
 ### Module hygiene
 
-- One responsibility per file. A file past ~300 lines is a signal to split, not a target.
+- **500 lines of implementation is a hard ceiling, not a target.** Aim for 300. Past 500,
+  the file is split in the same change that pushed it over — never "next time", because
+  next time is how a 300-line module becomes a 1,500-line one.
+- The count is implementation only; `#[cfg(test)] mod tests` does not count against it.
+  Tests are allowed to be long, and usually should be. But a test module several times its
+  implementation is itself a signal: either the file does too many things, or the tests are
+  repeating themselves. When tests genuinely dominate, move them to a sibling with
+  `#[cfg(test)] mod tests;` and a `tests.rs` beside the file — a child module keeps access
+  to private items, so nothing has to be made `pub` to be tested.
+- One responsibility per file, and the file is named after it.
 - `mod.rs` (or `lib.rs`) re-exports and declares submodules. It holds no logic.
 - Public surface is deliberate: `pub` only what another crate needs, `pub(crate)` otherwise.
 - No `util.rs` / `helpers.rs` / `common.rs` dumping grounds. Name modules after what they do.
+
+**Split by responsibility, never by line count.** Cutting a 900-line file at line 450
+produces two files that must be read together, which is worse than one. Ask what the file
+is doing and give each answer its own module — a service that handles a turn, dispatches
+actions and compacts a history is three modules, whatever the line count says.
+
+### Design principles
+
+These are the reasons behind the rules above. When a rule and a principle disagree, say so
+rather than picking silently.
+
+**SOLID**, as it applies here:
+
+- *Single responsibility* — one reason to change per module. A service that both talks to
+  the model and does CRUD changes when either does; that is two services.
+- *Open/closed* — adding a capability means a new implementation plus a registry entry, not
+  another arm on a `match`. `docs/reference-notes.md` §5 puts it bluntly: registries, never
+  `if name == ...`.
+- *Liskov* — every implementation of a port is substitutable for every other. The in-memory
+  fake and the SQLite repository must agree on ordering and on edge cases, or a service can
+  pass its tests and fail in production. Where they must agree, say so in the port's doc.
+- *Interface segregation* — ports stay narrow. A read-only calendar port is a better port
+  than a calendar port with `delete` on it that one caller needs.
+- *Dependency inversion* — services depend on port traits, never on adapters. Cargo already
+  enforces this across crates; hold the same line inside them.
+
+**GRASP**, where it earns its keep:
+
+- *Information expert* — behaviour belongs with the data it needs. `Reminder::is_done` is a
+  method on `Reminder`, not a function in a service that reaches into its fields.
+- *High cohesion, low coupling* — a module's contents should be usable only together. If
+  half of it could move out without anything noticing, it should.
+- *Pure fabrication* — some work belongs to no domain object. `prompt.rs` and `tools.rs`
+  exist for exactly that reason, and that is legitimate; `helpers.rs` is not, because it
+  names no responsibility.
+- *Protected variations* — a port exists wherever something outside our control could
+  change: a provider, a database, a calendar.
+
+**DRY, with its usual caveat.** Two pieces of code that look alike but change for different
+reasons are not duplication, and merging them couples two things that should move
+independently. The context line the model reads and the message the user reads describe the
+same reminder and are deliberately separate, because one serves a parser and the other a
+person. Duplicated *knowledge* is the thing to remove — a validation rule, a wire format, a
+schedule calculation — not duplicated shape.
 
 ## 3. Testing contract
 
 Every module carries its own unit tests; e2e covers the paths a user actually walks.
 
 **Unit tests — required, not aspirational.**
-- Live in the file they test, in `#[cfg(test)] mod tests`.
+- Live with the code they test, in `#[cfg(test)] mod tests` — in the same file, or in a
+  `tests.rs` beside it when they have outgrown it (see module hygiene). Either way they
+  are a child module, so they reach private items without anything being made `pub`.
 - Every service, every repository, every adapter, every non-trivial pure function.
 - Services are tested against `serana-testkit` fakes, never against real adapters.
 - Cover the error paths too: a tool that panics, malformed JSON arguments from the model, a
@@ -136,6 +191,23 @@ Every module carries its own unit tests; e2e covers the paths a user actually wa
 - At minimum: a plain chat turn, a single-tool turn, a multi-tool turn, and a turn where the
   tool returns an error.
 
+**Before a refactor, and before anything else.**
+
+A refactor is a change that must not alter behaviour, which is only a meaningful claim if
+the behaviour is pinned down first. So the order is: write the tests, watch them pass
+against the code as it stands, then move the code. Tests written afterwards describe
+whatever the refactor produced, including the parts it broke.
+
+- Cover what could break, not what is easy to reach: the paths through the code being
+  moved, its edge cases, and every behaviour the rest of the system relies on.
+- Those tests are written against the **public behaviour**, never the internals being
+  rearranged — a test coupled to the old shape has to be rewritten by the refactor, and
+  then it has stopped being evidence.
+- If a behaviour turns out to be untestable without the refactor, that is worth saying out
+  loud rather than skipping: it usually means the seam is in the wrong place.
+- A test that fails after the move is the refactor's fault until proven otherwise. Do not
+  adjust it to match the new behaviour without saying what changed and why.
+
 **Hard rules.**
 - No test makes a real network call or needs an API key. `cargo test` passes offline on a
   clean checkout.
@@ -145,8 +217,19 @@ Every module carries its own unit tests; e2e covers the paths a user actually wa
 ## 4. Style
 
 - Comments explain *why*, never *what*. No comment restating the line below it.
-- Errors are typed with `thiserror` in libraries and carry context. `unwrap()` and `expect()`
-  are for tests and for invariants proven on the line above; never on I/O or model output.
+- **An error variant exists because something branches on it.** A caller that behaves
+  differently — a different reply, a retry, a reminder switched off — needs a variant, and
+  it is named for that behaviour. `NotifyError::Unreachable` and `Transport` earn their keep
+  because the scheduler deactivates one and retries the other. Everything else is context on
+  the way to being reported, and belongs in `anyhow` or in an existing catch-all.
+  Five variants that all render "something went wrong" are one variant plus a message.
+- Two signs of having got this wrong: a variant nothing ever matches on, and two match arms
+  producing the same output. Both mean the type is describing the cause rather than the
+  consequence, and the caller did not need to know.
+- Port traits keep typed errors regardless. A port is a contract, and an implementor has to
+  know which failures it is required to distinguish.
+- `unwrap()` and `expect()` are for tests and for invariants proven on the line above; never
+  on I/O or model output.
 - Model output is untrusted input: parse it, do not assume it. Tool arguments are validated
   against the schema before dispatch, and a parse failure is fed back to the model as a tool
   error rather than propagated as a hard failure.

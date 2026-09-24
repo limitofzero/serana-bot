@@ -536,8 +536,32 @@ where
         Ok(reminder)
     }
 
-    /// Everything `owner` has, soonest first.
+    /// The moment this service reckons by.
+    ///
+    /// Exposed so a caller rendering a checklist decides what is ticked against the same
+    /// clock the service does, rather than reaching for the system one.
+    pub fn now(&self) -> jiff::Timestamp {
+        self.clock.now()
+    }
+
+    /// What `owner` still has coming, soonest first.
+    ///
+    /// Spent reminders are left out. A one-off that has already fired, or a reminder whose
+    /// schedule has run out, is history — it can never fire again, so listing it only
+    /// crowds out the ones that still matter. They stay in storage, and the model still
+    /// sees them, so "delete the one from yesterday" keeps working.
     pub async fn list(&self, owner: UserId) -> Result<Vec<Reminder>, ReminderError> {
+        Ok(self
+            .repository
+            .list_for_owner(owner)
+            .await?
+            .into_iter()
+            .filter(Reminder::is_active)
+            .collect())
+    }
+
+    /// Everything `owner` has, spent ones included.
+    pub async fn list_all(&self, owner: UserId) -> Result<Vec<Reminder>, ReminderError> {
         Ok(self.repository.list_for_owner(owner).await?)
     }
 
@@ -1193,6 +1217,44 @@ mod tests {
             service.repository.get(&created.id).await.unwrap().is_some(),
             "still stored"
         );
+    }
+
+    #[tokio::test]
+    async fn a_listing_leaves_out_what_can_never_fire_again() {
+        let service = service(extracting(serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15", "text": "call the bank"
+        })));
+        let created = create(&service, OWNER, "call the bank on the 15th")
+            .await
+            .unwrap();
+        assert_eq!(service.list(OWNER).await.unwrap().len(), 1, "still coming");
+
+        // Deliver it. A one-off has nothing after that.
+        let mut spent = created.clone();
+        spent
+            .mark_fired("2026-03-15T06:00:00Z".parse().unwrap())
+            .unwrap();
+        service.repository.put(&spent).await.unwrap();
+
+        assert!(
+            service.list(OWNER).await.unwrap().is_empty(),
+            "history does not crowd the listing"
+        );
+        // But it is still there, so it can still be named and deleted.
+        assert_eq!(service.list_all(OWNER).await.unwrap().len(), 1);
+        assert!(service.repository.get(&created.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_acknowledged_repeating_reminder_is_still_listed() {
+        // It is quiet, not finished — it comes back next period, so it is still coming.
+        let service = service(extracting(monthly_invoice()));
+        let created = create(&service, OWNER, "каждый месяц 20").await.unwrap();
+        service.acknowledge(OWNER, &created.id).await.unwrap();
+
+        let listed = service.list(OWNER).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].acknowledged_through.is_some());
     }
 
     #[tokio::test]

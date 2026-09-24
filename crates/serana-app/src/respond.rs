@@ -44,7 +44,7 @@ where
         },
 
         Command::Reminders => match service.list(user).await {
-            Ok(reminders) => text::listing(&reminders),
+            Ok(reminders) => text::listing(&reminders, service.now()),
             Err(error) => render_error(&error),
         },
     }

@@ -182,7 +182,7 @@ pub fn created(reminder: &Reminder, now: jiff::Timestamp) -> String {
 }
 
 /// One line per reminder.
-pub fn listing(reminders: &[Reminder]) -> String {
+pub fn listing(reminders: &[Reminder], now: jiff::Timestamp) -> String {
     if reminders.is_empty() {
         return NO_REMINDERS.to_owned();
     }
@@ -191,13 +191,25 @@ pub fn listing(reminders: &[Reminder]) -> String {
         if index > 0 {
             out.push('\n');
         }
-        // A spent reminder is still listed — it is the one the user is most likely hunting
-        // for — but it should not look like something that is still going to happen.
+        // Spent reminders are filtered out before they reach here, but a listing that
+        // renders one has to stay honest about it rather than claiming a firing time.
         let bell = if reminder.is_active() { "⏰" } else { "🔕" };
         out.push_str(&format!(
-            "{} {}\n   🗓 {}\n   {bell} {}\n   🆔 {}\n",
+            "{} {}\n",
             if reminder.is_active() { "•" } else { "◦" },
-            reminder.text,
+            reminder.text
+        ));
+        // The checklist is most of the point of a listing: what is left to do.
+        for item in &reminder.items {
+            let done = reminder.is_done(item, now).unwrap_or(false);
+            out.push_str(&format!(
+                "   {} {}\n",
+                if done { DONE } else { PENDING },
+                item.text
+            ));
+        }
+        out.push_str(&format!(
+            "   🗓 {}\n   {bell} {}\n   🆔 {}\n",
             describe(&reminder.recurrence),
             next_fire(reminder),
             reminder.id
@@ -534,7 +546,7 @@ mod tests {
         );
         r.text = "写发票".into();
         assert!(created(&r, jiff::Timestamp::UNIX_EPOCH).contains("写发票"));
-        assert!(listing(std::slice::from_ref(&r)).contains("写发票"));
+        assert!(listing(std::slice::from_ref(&r), jiff::Timestamp::UNIX_EPOCH).contains("写发票"));
         assert!(deleted(&r).contains("写发票"));
     }
 
@@ -558,7 +570,10 @@ mod tests {
             ("fired", fired(&r, now)),
             ("completed", completed(&r, &["one".into()], now)),
             ("acknowledged", acknowledged(&r)),
-            ("listing", listing(std::slice::from_ref(&r))),
+            (
+                "listing",
+                listing(std::slice::from_ref(&r), jiff::Timestamp::UNIX_EPOCH),
+            ),
         ] {
             assert!(
                 message.contains("🆔 a3f9k2xy"),
@@ -673,7 +688,7 @@ mod tests {
 
     #[test]
     fn an_empty_listing_says_so_instead_of_showing_a_bare_header() {
-        assert_eq!(listing(&[]), NO_REMINDERS);
+        assert_eq!(listing(&[], jiff::Timestamp::UNIX_EPOCH), NO_REMINDERS);
     }
 
     #[test]
@@ -693,7 +708,7 @@ mod tests {
                 Some("2026-03-20T06:00:00Z"),
             ),
         ];
-        let message = listing(&reminders);
+        let message = listing(&reminders, jiff::Timestamp::UNIX_EPOCH);
         assert_eq!(message.matches("🆔 a3f9k2xy").count(), 2, "{message}");
         assert!(message.contains("every day at 09:00"), "{message}");
         assert!(

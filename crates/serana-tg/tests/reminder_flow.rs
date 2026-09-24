@@ -441,3 +441,354 @@ async fn reminders_from_before_a_restart_still_fire_after_it() {
     assert_eq!(scheduler.tick().await.unwrap().delivered, 1);
     assert_eq!(notifier.messages_to(OWNER), vec!["оформить invoice"]);
 }
+
+// ---------------------------------------------------------------------------------------
+// Characterisation tests.
+//
+// Written before `ReminderService` is broken up, and deliberately at the outermost seam:
+// a command in, a rendered reply out, over a real database and a real wire format. Nothing
+// below reaches into the service's fields, so none of it has to be rewritten by the
+// refactor — which is the only way these remain evidence that behaviour was preserved
+// rather than a description of whatever the refactor produced.
+// ---------------------------------------------------------------------------------------
+
+/// A model that answers with prose rather than calling anything.
+async fn model_saying(content: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The payment checklist from the brief: the 1st to the 6th, three things to do.
+fn payment_checklist() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "monthly", "time": "12:00", "days_of_month": [1, 2, 3, 4, 5, 6],
+        "text": "monthly payment",
+        "items": ["exchange money", "transfer to tbc", "write to the banker"]
+    })
+}
+
+#[tokio::test]
+async fn a_checklist_survives_storage_and_comes_back_whole() {
+    let server = model_calling("create_reminder", payment_checklist()).await;
+    let h = harness(&server).await;
+
+    let reply = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("pay every month, 1st to 6th".into()),
+    )
+    .await;
+    assert!(reply.contains("monthly payment"), "{reply}");
+    for line in ["exchange money", "transfer to tbc", "write to the banker"] {
+        assert!(reply.contains(&format!("⚪ {line}")), "{reply}");
+    }
+
+    // Read back through a listing, which loads it from SQLite rather than from memory.
+    let listing = respond(&h.service, OWNER, &chat(), &Command::Reminders).await;
+    assert!(listing.contains("⚪ exchange money"), "{listing}");
+}
+
+#[tokio::test]
+async fn ticking_the_last_item_silences_the_rest_of_the_period() {
+    let server = model_calling("create_reminder", payment_checklist()).await;
+    let h = harness(&server).await;
+    let created = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("pay every month".into()),
+    )
+    .await;
+    let id = id_from(&created);
+
+    let server = model_calling(
+        "complete_items",
+        serde_json::json!({
+            "id": id,
+            "items": ["exchange money", "transfer to tbc", "write to the banker"]
+        }),
+    )
+    .await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    // Tick them off from *inside* the window — acknowledging a period you are not in
+    // silences nothing, because the next firing is already in the period after it.
+    h.clock.set("2026-04-02T08:00:00Z".parse().unwrap());
+    let done = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("did all three".into()),
+    )
+    .await;
+    assert!(done.contains("All done"), "{done}");
+    assert!(done.contains("quiet until"), "{done}");
+
+    // Days 3-6 of April are still ahead, and must stay silent.
+    let notifier = Arc::new(RecordingNotifier::new());
+    let scheduler = SchedulerService::new(
+        h.repository.clone(),
+        Arc::clone(&notifier),
+        Arc::clone(&h.clock),
+    );
+    h.clock.set("2026-04-03T08:00:00Z".parse().unwrap());
+    assert!(
+        scheduler.tick().await.unwrap().is_quiet(),
+        "the finished period must stay silent"
+    );
+
+    // May is a new period, so it comes back.
+    h.clock.set("2026-05-01T08:00:00Z".parse().unwrap());
+    assert_eq!(scheduler.tick().await.unwrap().delivered, 1);
+}
+
+#[tokio::test]
+async fn a_delivered_checklist_shows_only_what_is_outstanding() {
+    let server = model_calling("create_reminder", payment_checklist()).await;
+    let h = harness(&server).await;
+    let created = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("pay every month".into()),
+    )
+    .await;
+    let id = id_from(&created);
+
+    let server = model_calling(
+        "complete_items",
+        serde_json::json!({ "id": id, "items": ["exchange money"] }),
+    )
+    .await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("exchanged it".into()),
+    )
+    .await;
+
+    let notifier = Arc::new(RecordingNotifier::new());
+    let scheduler = SchedulerService::new(
+        h.repository.clone(),
+        Arc::clone(&notifier),
+        Arc::clone(&h.clock),
+    );
+    h.clock.set("2026-04-01T08:00:00Z".parse().unwrap());
+    assert_eq!(scheduler.tick().await.unwrap().delivered, 1);
+
+    let sent = notifier.messages_to(OWNER);
+    assert_eq!(sent, vec!["monthly payment".to_string()], "{sent:?}");
+}
+
+#[tokio::test]
+async fn a_question_asked_in_one_turn_is_answered_by_the_next() {
+    // The conversation is what makes "tomorrow at 9" mean anything, and it lives in SQLite.
+    let server = model_saying("What time should I remind you?").await;
+    let h = harness(&server).await;
+
+    let asked = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("remind me to call the bank".into()),
+    )
+    .await;
+    assert_eq!(asked, "What time should I remind you?");
+
+    let server = model_calling(
+        "create_reminder",
+        serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-11", "text": "call the bank"
+        }),
+    )
+    .await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    let answered = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("tomorrow at 9".into()),
+    )
+    .await;
+    assert!(answered.contains("call the bank"), "{answered}");
+}
+
+#[tokio::test]
+async fn compacting_keeps_the_conversation_usable() {
+    let server = model_saying("What time?").await;
+    let h = harness(&server).await;
+    respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("remind me about something".into()),
+    )
+    .await;
+
+    let server = model_saying("Notes: they want a reminder, time unknown.").await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    let compacted = respond(&h.service, OWNER, &chat(), &Command::Compact).await;
+    assert!(compacted.contains("Folded"), "{compacted}");
+
+    // And the next turn still works, which is the part a bad compaction breaks: a
+    // conversation left tail-first on a user message cannot accept another one.
+    let server = model_saying("Still what time?").await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    let after = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("hello".into()),
+    )
+    .await;
+    assert_eq!(after, "Still what time?");
+}
+
+#[tokio::test]
+async fn a_listing_shows_what_is_coming_and_hides_what_is_spent() {
+    let server = model_calling(
+        "create_reminder",
+        serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15", "text": "call the bank"
+        }),
+    )
+    .await;
+    let h = harness(&server).await;
+    respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("call the bank on the 15th".into()),
+    )
+    .await;
+    assert!(
+        respond(&h.service, OWNER, &chat(), &Command::Reminders)
+            .await
+            .contains("call the bank")
+    );
+
+    // Deliver it. A one-off has nothing after that.
+    let notifier = Arc::new(RecordingNotifier::new());
+    let scheduler = SchedulerService::new(
+        h.repository.clone(),
+        Arc::clone(&notifier),
+        Arc::clone(&h.clock),
+    );
+    h.clock.set("2026-03-15T06:00:00Z".parse().unwrap());
+    assert_eq!(scheduler.tick().await.unwrap().delivered, 1);
+
+    let listing = respond(&h.service, OWNER, &chat(), &Command::Reminders).await;
+    assert!(
+        !listing.contains("call the bank"),
+        "history should not crowd the listing: {listing}"
+    );
+    // Still in storage, so it can still be named.
+    assert_eq!(h.repository.list_for_owner(OWNER).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn acknowledging_a_one_off_removes_it_but_a_repeating_one_returns() {
+    let server = model_calling(
+        "create_reminder",
+        serde_json::json!({
+            "kind": "once", "time": "09:00", "date": "2026-03-15", "text": "call the bank"
+        }),
+    )
+    .await;
+    let h = harness(&server).await;
+    let created = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("call the bank".into()),
+    )
+    .await;
+    let id = id_from(&created);
+
+    let server = model_calling("acknowledge_reminder", serde_json::json!({ "id": id })).await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    let done = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("called them".into()),
+    )
+    .await;
+    assert!(done.contains("Removed"), "{done}");
+    assert!(
+        h.repository.list_for_owner(OWNER).await.unwrap().is_empty(),
+        "a finished one-off is deleted, not kept"
+    );
+}
+
+#[tokio::test]
+async fn an_update_keeps_the_reminders_identity() {
+    let server = model_calling("create_reminder", payment_checklist()).await;
+    let h = harness(&server).await;
+    let created = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("pay every month".into()),
+    )
+    .await;
+    let id = id_from(&created);
+
+    let server = model_calling(
+        "update_reminder",
+        serde_json::json!({
+            "id": id, "kind": "monthly", "time": "22:30", "days_of_month": [1, 2, 3],
+            "text": "monthly payment",
+            "items": ["exchange money", "transfer to tbc", "write to the banker"]
+        }),
+    )
+    .await;
+    let h = Harness {
+        service: rebuild_service(&server, &h),
+        ..h
+    };
+    let updated = respond(
+        &h.service,
+        OWNER,
+        &chat(),
+        &Command::Reminder("move it to 22:30".into()),
+    )
+    .await;
+
+    assert!(updated.contains("Updated"), "{updated}");
+    assert_eq!(id_from(&updated), id, "same reminder, not a new one");
+    assert_eq!(
+        h.repository.list_for_owner(OWNER).await.unwrap().len(),
+        1,
+        "changed, not duplicated"
+    );
+}
