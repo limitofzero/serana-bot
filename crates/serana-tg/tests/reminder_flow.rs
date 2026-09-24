@@ -17,7 +17,7 @@ use serana_app::{Command, respond};
 use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::{MonthDays, Recurrence, ReminderRepository, TimeZoneName, UserId};
 use serana_services::{
-    DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
+    ChatService, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
 };
 use serana_testkit::{FixedClock, RecordingNotifier};
 use tempfile::TempDir;
@@ -32,7 +32,7 @@ fn chat() -> ConversationId {
 /// 10:00 in Tbilisi.
 const CREATED_AT: &str = "2026-03-10T06:00:00Z";
 
-type Service = ReminderService<
+type Service = ChatService<
     SqliteReminderRepository,
     OpenAiProvider,
     Arc<FixedClock>,
@@ -102,11 +102,9 @@ async fn harness(server: &MockServer) -> Harness {
     })
     .unwrap();
 
-    let service = ReminderService::new(
-        repository.clone(),
+    let service = ChatService::new(
+        ReminderService::new(repository.clone(), Arc::clone(&clock), RandomIds),
         provider,
-        Arc::clone(&clock),
-        RandomIds,
         conversations.clone(),
         ReminderConfig {
             model: "gpt-5-mini".into(),
@@ -140,11 +138,13 @@ fn rebuild_service(server: &MockServer, existing: &Harness) -> Service {
     })
     .unwrap();
 
-    ReminderService::new(
-        existing.repository.clone(),
+    ChatService::new(
+        ReminderService::new(
+            existing.repository.clone(),
+            Arc::clone(&existing.clock),
+            RandomIds,
+        ),
         provider,
-        Arc::clone(&existing.clock),
-        RandomIds,
         existing.conversations.clone(),
         ReminderConfig {
             model: "gpt-5-mini".into(),

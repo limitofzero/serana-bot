@@ -8,6 +8,6 @@
 pub mod reminders;
 
 pub use reminders::{
-    DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderError, ReminderOutcome, ReminderService,
-    SchedulerService, TickReport,
+    ChatService, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderError, ReminderOutcome,
+    ReminderService, SchedulerService, TickReport,
 };

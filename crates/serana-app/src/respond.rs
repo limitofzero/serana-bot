@@ -8,13 +8,13 @@ use serana_domain::conversation::ConversationId;
 use serana_domain::conversation_store::ConversationRepository;
 use serana_domain::reminder::{ReminderRepository, UserId};
 use serana_domain::{Clock, IdGenerator, LlmProvider};
-use serana_services::{ReminderError, ReminderService};
+use serana_services::{ChatService, ReminderError};
 
 use crate::{Command, text};
 
 /// Produce the reply for `command`, issued by `user`.
 pub async fn respond<R, L, C, I, V>(
-    service: &ReminderService<R, L, C, I, V>,
+    service: &ChatService<R, L, C, I, V>,
     user: UserId,
     conversation: &ConversationId,
     command: &Command,
@@ -43,8 +43,8 @@ where
             Err(error) => render_error(&error),
         },
 
-        Command::Reminders => match service.list(user).await {
-            Ok(reminders) => text::listing(&reminders, service.now()),
+        Command::Reminders => match service.reminders().list(user).await {
+            Ok(reminders) => text::listing(&reminders, service.reminders().now()),
             Err(error) => render_error(&error),
         },
     }
@@ -83,7 +83,7 @@ mod tests {
 
     use serana_domain::message::ToolCall;
     use serana_domain::reminder::TimeZoneName;
-    use serana_services::{DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig};
+    use serana_services::{DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService};
     use serana_testkit::{
         FixedClock, InMemoryConversationRepository, InMemoryReminderRepository, ScriptedLlm,
         SequentialIds,
@@ -99,7 +99,7 @@ mod tests {
     const OWNER: UserId = UserId::new(42);
     const OTHER: UserId = UserId::new(7);
 
-    type Service = ReminderService<
+    type Service = ChatService<
         InMemoryReminderRepository,
         Arc<ScriptedLlm>,
         FixedClock,
@@ -111,11 +111,13 @@ mod tests {
     /// a command did *not* reach the provider.
     fn service_with_llm(llm: ScriptedLlm) -> (Service, Arc<ScriptedLlm>) {
         let llm = Arc::new(llm);
-        let service = ReminderService::new(
-            InMemoryReminderRepository::new(),
+        let service = ChatService::new(
+            ReminderService::new(
+                InMemoryReminderRepository::new(),
+                FixedClock::at("2026-03-10T06:00:00Z"),
+                SequentialIds::default(),
+            ),
             Arc::clone(&llm),
-            FixedClock::at("2026-03-10T06:00:00Z"),
-            SequentialIds::default(),
             InMemoryConversationRepository::new(),
             ReminderConfig {
                 model: "gpt-5-mini".into(),
@@ -293,7 +295,10 @@ mod tests {
         .await;
         assert!(reply.contains("Deleted"), "{reply}");
         assert!(reply.contains("оформить invoice"), "{reply}");
-        assert!(service.list(OWNER).await.unwrap().is_empty(), "it is gone");
+        assert!(
+            service.reminders().list(OWNER).await.unwrap().is_empty(),
+            "it is gone"
+        );
     }
 
     #[tokio::test]
@@ -380,7 +385,7 @@ mod tests {
         assert!(done.contains("quiet until"), "{done}");
 
         // Still there, just silent for the rest of this period.
-        let stored = service.list(OWNER).await.unwrap();
+        let stored = service.reminders().list(OWNER).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].acknowledged_through.is_some());
     }
@@ -433,7 +438,7 @@ mod tests {
         assert!(reply.contains("Done"), "{reply}");
         assert!(reply.contains("quiet until"), "{reply}");
         assert_eq!(
-            service.list(OWNER).await.unwrap().len(),
+            service.reminders().list(OWNER).await.unwrap().len(),
             1,
             "acknowledging keeps the reminder"
         );
@@ -469,7 +474,7 @@ mod tests {
             reply.contains("every month on the 20th to the 26th at 22:30"),
             "{reply}"
         );
-        let stored = service.list(OWNER).await.unwrap();
+        let stored = service.reminders().list(OWNER).await.unwrap();
         assert_eq!(stored.len(), 1, "changed, not duplicated");
         assert_eq!(stored[0].id.as_str(), FIRST_ID, "same reminder");
     }
@@ -513,7 +518,7 @@ mod tests {
         .await;
         assert!(reply.contains("No reminder with id"), "{reply}");
         assert_eq!(
-            service.list(OWNER).await.unwrap().len(),
+            service.reminders().list(OWNER).await.unwrap().len(),
             1,
             "it is left alone"
         );

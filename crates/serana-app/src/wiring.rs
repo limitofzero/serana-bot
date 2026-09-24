@@ -13,13 +13,13 @@ use serana_adapters::{
 };
 use serana_domain::reminder::Notifier;
 use serana_services::{
-    DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
+    ChatService, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
 };
 
 use crate::AppConfig;
 
 /// The reminder service, with every port resolved to its real implementation.
-pub type Reminders = ReminderService<
+pub type Reminders = ChatService<
     SqliteReminderRepository,
     Arc<OpenAiProvider>,
     SystemClock,
@@ -55,11 +55,9 @@ pub async fn build_reminders(config: &AppConfig) -> anyhow::Result<Wiring> {
         .await
         .with_context(|| format!("could not open {}", config.database_path().display()))?;
 
-    let reminders = ReminderService::new(
-        repository.clone(),
+    let reminders = ChatService::new(
+        ReminderService::new(repository.clone(), SystemClock, RandomIds),
         provider,
-        SystemClock,
-        RandomIds,
         conversations,
         ReminderConfig {
             model: config.model.clone(),
