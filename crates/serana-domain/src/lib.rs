@@ -10,6 +10,7 @@
 //! the system prompt is byte-stable for the life of a conversation, and messages alternate
 //! strictly. Both live in [`conversation`]; `docs/reference-notes.md` records why.
 
+pub mod calendar;
 pub mod clock;
 pub mod conversation;
 pub mod conversation_store;
@@ -22,6 +23,7 @@ pub mod reminder;
 pub mod retrieval;
 pub mod tool;
 
+pub use calendar::{CalendarError, CalendarEvent, CalendarPort, Cancellation, EventId, NewEvent};
 pub use clock::Clock;
 pub use conversation::{AlternationError, Conversation, ConversationId, Tail};
 pub use conversation_store::ConversationRepository;

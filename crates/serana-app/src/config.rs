@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use serana_adapters::GoogleCalendarConfig;
 use serana_domain::reminder::TimeZoneName;
 
 /// Where reminders live inside the container. Overridden by `SERANA_DATA_DIR`.
@@ -18,6 +19,9 @@ const DEFAULT_TIMEZONE: &str = "Asia/Tbilisi";
 /// How often the scheduler looks for due reminders. A minute is well under the resolution
 /// anyone schedules a reminder at, and costs one indexed query.
 const DEFAULT_TICK_SECONDS: u64 = 60;
+/// How long to reserve either side of an appointment the person has to travel to. Half an
+/// hour is a city's worth of getting there; `SERANA_TRAVEL_MINUTES` overrides it.
+const DEFAULT_TRAVEL_MINUTES: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -32,6 +36,11 @@ pub struct AppConfig {
     pub tick_interval: Duration,
     /// Sampling temperature for extraction calls, or `None` for the provider's default.
     pub temperature: Option<f32>,
+    /// Google Calendar, or `None` when nothing is configured. Absent is a supported way to
+    /// run: reminders do not need one, and the assistant says so rather than failing.
+    pub calendar: Option<GoogleCalendarConfig>,
+    /// Reserved either side of an in-person appointment.
+    pub travel: Duration,
 }
 
 impl AppConfig {
@@ -65,6 +74,10 @@ impl AppConfig {
             _ => None,
         };
 
+        let travel_minutes = var_or("SERANA_TRAVEL_MINUTES", &DEFAULT_TRAVEL_MINUTES.to_string())
+            .parse::<u64>()
+            .context("SERANA_TRAVEL_MINUTES must be a whole number of minutes")?;
+
         Ok(Self {
             api_key,
             base_url: var_or("SERANA_BASE_URL", DEFAULT_BASE_URL),
@@ -77,12 +90,31 @@ impl AppConfig {
             data_dir: PathBuf::from(var_or("SERANA_DATA_DIR", DEFAULT_DATA_DIR)),
             tick_interval: Duration::from_secs(tick_seconds),
             temperature,
+            calendar: google_from_env(),
+            travel: Duration::from_secs(travel_minutes * 60),
         })
     }
 
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("serana.db")
     }
+}
+
+/// Google Calendar from the environment, or `None` when the three secrets are not all
+/// there.
+///
+/// Partial configuration is treated as none rather than as an error: a half-filled `.env`
+/// is how someone is left with a bot that will not start, and there is nothing here that
+/// reminders need.
+fn google_from_env() -> Option<GoogleCalendarConfig> {
+    let config = GoogleCalendarConfig {
+        client_id: var_or("SERANA_GOOGLE_CLIENT_ID", ""),
+        client_secret: var_or("SERANA_GOOGLE_CLIENT_SECRET", ""),
+        refresh_token: var_or("SERANA_GOOGLE_REFRESH_TOKEN", ""),
+        calendar_id: var_or("SERANA_GOOGLE_CALENDAR_ID", "primary"),
+        ..GoogleCalendarConfig::default()
+    };
+    config.is_configured().then_some(config)
 }
 
 pub fn var_or(key: &str, fallback: &str) -> String {
@@ -106,6 +138,8 @@ mod tests {
             data_dir: PathBuf::from("/data"),
             tick_interval: Duration::from_secs(60),
             temperature: None,
+            calendar: None,
+            travel: Duration::from_secs(30 * 60),
         }
     }
 
@@ -131,6 +165,33 @@ mod tests {
         unsafe { std::env::set_var(key, "  actual  ") };
         assert_eq!(var_or(key, "fallback"), "actual", "values are trimmed");
         unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn a_half_filled_google_block_configures_no_calendar_rather_than_a_broken_one() {
+        // A `.env` with the id pasted in and the token still to come is the normal state
+        // halfway through setting this up. It must not stop the bot starting.
+        let keys = [
+            "SERANA_GOOGLE_CLIENT_ID",
+            "SERANA_GOOGLE_CLIENT_SECRET",
+            "SERANA_GOOGLE_REFRESH_TOKEN",
+        ];
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
+        assert!(google_from_env().is_none(), "nothing set");
+
+        unsafe { std::env::set_var("SERANA_GOOGLE_CLIENT_ID", "id") };
+        assert!(google_from_env().is_none(), "only the id");
+
+        unsafe { std::env::set_var("SERANA_GOOGLE_CLIENT_SECRET", "secret") };
+        unsafe { std::env::set_var("SERANA_GOOGLE_REFRESH_TOKEN", "token") };
+        let configured = google_from_env().expect("all three");
+        assert_eq!(configured.calendar_id, "primary", "the default calendar");
+
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 
     #[test]

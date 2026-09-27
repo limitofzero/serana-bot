@@ -71,5 +71,6 @@ and `adapters` both point at `domain` and never at each other; only the binaries
 | --- | --- |
 | `docs/concept.md` | What serana is trying to be: the `LLM + harness` model this project follows, the six parts of that harness, and how far along each one is. |
 | `docs/reminders.md` | How a reminder actually flows through the crates — the one feature that is finished. |
+| `docs/calendar.md` | How `/calendar` works, and the one-loop-many-subjects shape that made room for it. |
 | `docs/reference-notes.md` | Findings from reading the Python implementation this reimplements. |
 | `.claude/skills/serana/SKILL.md` | The engineering rules: layering, the approved crate stack, the testing contract. Binding for every change. |

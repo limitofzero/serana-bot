@@ -1,4 +1,9 @@
-//! What a reminder turn is configured with.
+//! What a conversation is configured with.
+//!
+//! One struct for every capability: the model, the compaction threshold and the local zone
+//! are properties of *talking to this person*, not of what is being talked about. A second
+//! copy per topic is how the reminder conversation and the calendar conversation end up on
+//! different models without anyone deciding that.
 
 use serana_domain::reminder::TimeZoneName;
 
@@ -6,11 +11,12 @@ use serana_domain::reminder::TimeZoneName;
 pub const DEFAULT_COMPACT_ABOVE_TOKENS: u64 = 16_000;
 
 #[derive(Debug, Clone)]
-pub struct ReminderConfig {
+pub struct ChatConfig {
     /// Model used to read the request. A small one is enough; this is extraction, not
     /// reasoning.
     pub model: String,
-    /// Zone every new reminder is created in.
+    /// Zone the person lives in: what "tomorrow at 9" resolves against, and what every
+    /// reminder and event is created in.
     pub default_timezone: TimeZoneName,
     /// Model for summarising when a conversation is compacted. A smaller one is plenty:
     /// nobody reads the summary but the model itself. Falls back to [`Self::model`].
@@ -30,7 +36,7 @@ pub struct ReminderConfig {
     pub temperature: Option<f32>,
 }
 
-impl ReminderConfig {
+impl ChatConfig {
     /// The model used for summarising, falling back to the main one.
     pub fn summary_model(&self) -> &str {
         self.summary_model.as_deref().unwrap_or(&self.model)

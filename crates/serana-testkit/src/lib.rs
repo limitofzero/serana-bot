@@ -6,6 +6,7 @@
 //! is tested against the real thing it adapts (a mock HTTP server, a temporary directory),
 //! never against a fake of itself.
 
+pub mod calendar;
 pub mod clock;
 pub mod conversations;
 pub mod llm;
@@ -13,6 +14,7 @@ pub mod notifier;
 pub mod reminders;
 pub mod tools;
 
+pub use calendar::InMemoryCalendar;
 pub use clock::FixedClock;
 pub use conversations::InMemoryConversationRepository;
 pub use llm::ScriptedLlm;

@@ -1,26 +1,13 @@
-//! Everything the bot says.
+//! Everything the bot says about reminders.
 //!
-//! Isolated in one module so the wording can be changed, or the bot translated, by editing
-//! a single file. The copy is English; what the *user* writes may be in any language, and
-//! their own words are echoed back untouched — see [`created`] and [`listing`], which
-//! interpolate `reminder.text` exactly as it was stored.
+//! The copy is English; what the *user* writes may be in any language, and their own words
+//! are echoed back untouched — see [`created`] and [`listing`], which interpolate
+//! `reminder.text` exactly as it was stored.
 
 use serana_domain::reminder::{MonthDays, Recurrence, Reminder, Weekday};
 use serana_services::ReminderOutcome;
 
-pub const HELP: &str = "\
-Serana — your reminders, in plain words.
-
-/reminder — set, change, remove or finish one
-/reminders — list them
-/compact — fold this conversation up into a summary
-/help — this message
-
-Just say what you want:
-  /reminder every month on the 20th, issue an invoice
-  /reminder move the invoice one to 22:30
-  /reminder I already sent the invoice
-  /reminder remove the invoice reminder";
+use super::format::{day_and_month, hhmm, list, ordinal};
 
 pub const REMINDER_NEEDS_TEXT: &str = "Say what to remind you about, and when.\n\
      For example: /reminder every month on the 20th, issue an invoice";
@@ -28,27 +15,13 @@ pub const REMINDER_NEEDS_TEXT: &str = "Say what to remind you about, and when.\n
 pub const NO_REMINDERS: &str =
     "No reminders yet.\nSet one: /reminder every month on the 20th, issue an invoice";
 
-pub const COMPACTED: &str =
-    "🧹 Folded the conversation up into a summary. I still know where we got to.";
-
-pub const NOTHING_TO_COMPACT: &str = "Nothing to fold up yet.";
-
-pub const UNKNOWN_COMMAND: &str =
-    "I do not know that command.\nJust say what you want — /help lists what I can do.";
-
-pub const NOT_ALLOWED: &str = "This is a personal bot and does not answer you.";
-
-/// Join phrases the way a person would: "a", "a and b", "a, b and c".
-fn list(parts: &[String]) -> String {
-    match parts {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
-}
-
 /// How a checklist line is marked. A tick for finished, a plain circle for not yet —
 /// deliberately not a cross, which reads as failed rather than outstanding.
+/// The marker every message naming a reminder carries. Distinct from the calendar's, so a
+/// reply to one of our own messages can be aimed at the conversation it came from — see
+/// [`super::topic_of`].
+pub(super) const ID: &str = "🆔";
+
 const DONE: &str = "✅";
 const PENDING: &str = "⚪";
 
@@ -62,49 +35,6 @@ fn weekday_name(weekday: Weekday) -> &'static str {
         Weekday::Saturday => "Saturday",
         Weekday::Sunday => "Sunday",
     }
-}
-
-const MONTHS: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-
-fn hhmm(time: jiff::civil::Time) -> String {
-    format!("{:02}:{:02}", time.hour(), time.minute())
-}
-
-/// `20` becomes `20th`, `21` becomes `21st`.
-///
-/// The teens are the exception the naive rule gets wrong: 11, 12 and 13 take "th" despite
-/// ending in 1, 2 and 3.
-fn ordinal(day: i8) -> String {
-    let suffix = match (day % 10, day % 100) {
-        (_, 11..=13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{day}{suffix}")
-}
-
-fn day_and_month(date: jiff::civil::Date) -> String {
-    // `month()` is 1-12, so the index is always in range.
-    format!(
-        "{} {}",
-        date.day(),
-        MONTHS[usize::from(date.month() as u8) - 1]
-    )
 }
 
 /// A recurrence in words — the reason schedules are stored as an enum rather than as cron.

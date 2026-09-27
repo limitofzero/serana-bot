@@ -1,6 +1,6 @@
 //! Creating, listing and cancelling reminders, and the conversation that drives them.
 
-mod config;
+mod capability;
 mod error;
 mod outcome;
 mod parse;
@@ -10,7 +10,7 @@ mod service;
 mod tools;
 mod turn;
 
-pub use config::{DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig};
+pub use capability::Reminding;
 pub use error::ReminderError;
 pub use outcome::ReminderOutcome;
 pub use scheduler::{SchedulerService, TickReport};

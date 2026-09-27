@@ -60,7 +60,14 @@ async fn main() -> anyhow::Result<()> {
             Input::Command(command) => {
                 println!(
                     "{}\n",
-                    respond(&wiring.reminders, owner, &conversation, &command).await
+                    respond(
+                        &wiring.reminders,
+                        wiring.calendar.as_ref(),
+                        owner,
+                        &conversation,
+                        &command,
+                    )
+                    .await
                 );
             }
         }

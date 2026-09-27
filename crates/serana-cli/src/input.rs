@@ -33,6 +33,7 @@ pub fn parse(line: &str) -> Input {
         "help" | "h" | "?" => Input::Command(Command::Help),
         "reminder" => Input::Command(Command::Reminder(rest.to_owned())),
         "reminders" => Input::Command(Command::Reminders),
+        "calendar" | "cal" => Input::Command(Command::Calendar(rest.to_owned())),
         "compact" => Input::Command(Command::Compact),
         "quit" | "exit" | "q" => Input::Quit,
         other => Input::Unknown(other.to_owned()),
@@ -47,6 +48,20 @@ mod tests {
     fn a_slash_is_optional() {
         assert_eq!(parse("/reminders"), Input::Command(Command::Reminders));
         assert_eq!(parse("reminders"), Input::Command(Command::Reminders));
+    }
+
+    #[test]
+    fn the_calendar_takes_the_rest_of_the_line_verbatim() {
+        let request = "что у меня в пятницу?";
+        assert_eq!(
+            parse(&format!("/calendar {request}")),
+            Input::Command(Command::Calendar(request.to_owned()))
+        );
+        assert_eq!(
+            parse("cal"),
+            Input::Command(Command::Calendar(String::new())),
+            "the short form reaches the same place"
+        );
     }
 
     #[test]

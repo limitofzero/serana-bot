@@ -17,9 +17,10 @@ use serana_app::{Command, respond};
 use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::{MonthDays, Recurrence, ReminderRepository, TimeZoneName, UserId};
 use serana_services::{
-    ChatService, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService, SchedulerService,
+    CalendarChat, ChatConfig, ChatService, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderService,
+    SchedulerService,
 };
-use serana_testkit::{FixedClock, RecordingNotifier};
+use serana_testkit::{FixedClock, InMemoryCalendar, RecordingNotifier};
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -39,6 +40,15 @@ type Service = ChatService<
     RandomIds,
     SqliteConversationRepository,
 >;
+
+/// These tests are about reminders, and a deployment with no calendar configured is a real
+/// one: the argument is threaded through so the turn is the same either way.
+type Calendar =
+    CalendarChat<InMemoryCalendar, OpenAiProvider, Arc<FixedClock>, SqliteConversationRepository>;
+
+fn no_calendar() -> Option<&'static Calendar> {
+    None
+}
 
 struct Harness {
     /// Held so the database file outlives the test.
@@ -106,7 +116,7 @@ async fn harness(server: &MockServer) -> Harness {
         ReminderService::new(repository.clone(), Arc::clone(&clock), RandomIds),
         provider,
         conversations.clone(),
-        ReminderConfig {
+        ChatConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
             temperature: None,
@@ -146,7 +156,7 @@ fn rebuild_service(server: &MockServer, existing: &Harness) -> Service {
         ),
         provider,
         existing.conversations.clone(),
-        ReminderConfig {
+        ChatConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
             temperature: None,
@@ -174,6 +184,7 @@ async fn a_request_becomes_a_stored_reminder_that_later_arrives() {
     // 1. The user types the command from the brief.
     let reply = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("каждый месяц 20 число - писать мне что надо оформить invoice".into()),
@@ -235,6 +246,7 @@ async fn the_model_is_asked_in_the_wire_format_it_expects() {
     let h = harness(&server).await;
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("каждый месяц 20 число".into()),
@@ -298,6 +310,7 @@ async fn a_reminder_listed_and_then_deleted_leaves_the_database_empty() {
 
     let created = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("каждый месяц 20".into()),
@@ -305,7 +318,14 @@ async fn a_reminder_listed_and_then_deleted_leaves_the_database_empty() {
     .await;
     let id = id_from(&created);
 
-    let listing = respond(&h.service, OWNER, &chat(), &Command::Reminders).await;
+    let listing = respond(
+        &h.service,
+        no_calendar(),
+        OWNER,
+        &chat(),
+        &Command::Reminders,
+    )
+    .await;
     assert!(listing.contains("оформить invoice"), "{listing}");
     assert!(listing.contains(&id), "{listing}");
 
@@ -318,6 +338,7 @@ async fn a_reminder_listed_and_then_deleted_leaves_the_database_empty() {
     };
     let deleted = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("remove the invoice reminder".into()),
@@ -339,6 +360,7 @@ async fn a_one_off_is_delivered_once_and_then_stops_for_good() {
     let h = harness(&server).await;
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("15 марта в 9 позвонить в банк".into()),
@@ -374,6 +396,7 @@ async fn a_month_of_downtime_produces_one_message_not_thirty() {
     let h = harness(&server).await;
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("каждый день в 10".into()),
@@ -408,6 +431,7 @@ async fn a_model_outage_leaves_nothing_behind_and_says_so() {
 
     let reply = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("каждый день в 10".into()),
@@ -423,6 +447,7 @@ async fn reminders_from_before_a_restart_still_fire_after_it() {
     let h = harness(&server).await;
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("каждый месяц 20 число".into()),
@@ -483,6 +508,7 @@ async fn a_checklist_survives_storage_and_comes_back_whole() {
 
     let reply = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("pay every month, 1st to 6th".into()),
@@ -494,7 +520,14 @@ async fn a_checklist_survives_storage_and_comes_back_whole() {
     }
 
     // Read back through a listing, which loads it from SQLite rather than from memory.
-    let listing = respond(&h.service, OWNER, &chat(), &Command::Reminders).await;
+    let listing = respond(
+        &h.service,
+        no_calendar(),
+        OWNER,
+        &chat(),
+        &Command::Reminders,
+    )
+    .await;
     assert!(listing.contains("⚪ exchange money"), "{listing}");
 }
 
@@ -504,6 +537,7 @@ async fn ticking_the_last_item_silences_the_rest_of_the_period() {
     let h = harness(&server).await;
     let created = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("pay every month".into()),
@@ -528,6 +562,7 @@ async fn ticking_the_last_item_silences_the_rest_of_the_period() {
     h.clock.set("2026-04-02T08:00:00Z".parse().unwrap());
     let done = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("did all three".into()),
@@ -560,6 +595,7 @@ async fn a_delivered_checklist_shows_only_what_is_outstanding() {
     let h = harness(&server).await;
     let created = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("pay every month".into()),
@@ -578,6 +614,7 @@ async fn a_delivered_checklist_shows_only_what_is_outstanding() {
     };
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("exchanged it".into()),
@@ -605,6 +642,7 @@ async fn a_question_asked_in_one_turn_is_answered_by_the_next() {
 
     let asked = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("remind me to call the bank".into()),
@@ -625,6 +663,7 @@ async fn a_question_asked_in_one_turn_is_answered_by_the_next() {
     };
     let answered = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("tomorrow at 9".into()),
@@ -639,6 +678,7 @@ async fn compacting_keeps_the_conversation_usable() {
     let h = harness(&server).await;
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("remind me about something".into()),
@@ -650,7 +690,7 @@ async fn compacting_keeps_the_conversation_usable() {
         service: rebuild_service(&server, &h),
         ..h
     };
-    let compacted = respond(&h.service, OWNER, &chat(), &Command::Compact).await;
+    let compacted = respond(&h.service, no_calendar(), OWNER, &chat(), &Command::Compact).await;
     assert!(compacted.contains("Folded"), "{compacted}");
 
     // And the next turn still works, which is the part a bad compaction breaks: a
@@ -662,6 +702,7 @@ async fn compacting_keeps_the_conversation_usable() {
     };
     let after = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("hello".into()),
@@ -682,15 +723,22 @@ async fn a_listing_shows_what_is_coming_and_hides_what_is_spent() {
     let h = harness(&server).await;
     respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("call the bank on the 15th".into()),
     )
     .await;
     assert!(
-        respond(&h.service, OWNER, &chat(), &Command::Reminders)
-            .await
-            .contains("call the bank")
+        respond(
+            &h.service,
+            no_calendar(),
+            OWNER,
+            &chat(),
+            &Command::Reminders
+        )
+        .await
+        .contains("call the bank")
     );
 
     // Deliver it. A one-off has nothing after that.
@@ -703,7 +751,14 @@ async fn a_listing_shows_what_is_coming_and_hides_what_is_spent() {
     h.clock.set("2026-03-15T06:00:00Z".parse().unwrap());
     assert_eq!(scheduler.tick().await.unwrap().delivered, 1);
 
-    let listing = respond(&h.service, OWNER, &chat(), &Command::Reminders).await;
+    let listing = respond(
+        &h.service,
+        no_calendar(),
+        OWNER,
+        &chat(),
+        &Command::Reminders,
+    )
+    .await;
     assert!(
         !listing.contains("call the bank"),
         "history should not crowd the listing: {listing}"
@@ -724,6 +779,7 @@ async fn acknowledging_a_one_off_removes_it_but_a_repeating_one_returns() {
     let h = harness(&server).await;
     let created = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("call the bank".into()),
@@ -738,6 +794,7 @@ async fn acknowledging_a_one_off_removes_it_but_a_repeating_one_returns() {
     };
     let done = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("called them".into()),
@@ -756,6 +813,7 @@ async fn an_update_keeps_the_reminders_identity() {
     let h = harness(&server).await;
     let created = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("pay every month".into()),
@@ -778,6 +836,7 @@ async fn an_update_keeps_the_reminders_identity() {
     };
     let updated = respond(
         &h.service,
+        no_calendar(),
         OWNER,
         &chat(),
         &Command::Reminder("move it to 22:30".into()),

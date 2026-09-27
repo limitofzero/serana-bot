@@ -9,9 +9,11 @@ pub mod command;
 pub mod config;
 pub mod respond;
 pub mod text;
+pub mod topics;
 pub mod wiring;
 
-pub use command::Command;
+pub use command::{Command, Topic};
 pub use config::AppConfig;
 pub use respond::respond;
-pub use wiring::{Reminders, Wiring, build_reminders, build_scheduler};
+pub use topics::Topics;
+pub use wiring::{Calendar, Reminders, Wiring, build_reminders, build_scheduler};

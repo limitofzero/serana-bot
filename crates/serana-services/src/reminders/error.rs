@@ -32,3 +32,9 @@ pub enum ReminderError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
+
+impl crate::chat::TurnError for ReminderError {
+    fn malformed(reason: String) -> Self {
+        Self::Unparsable(reason)
+    }
+}

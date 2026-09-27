@@ -145,12 +145,6 @@ pub(crate) fn context(
     )
 }
 
-/// What to ask the model for when a conversation has grown too long to keep re-sending.
-pub(crate) const SUMMARISE: &str = "Summarise the conversation below so it can stand in for \
-     the full history. Keep anything still unresolved — a question you asked that has not \
-     been answered, a reminder being discussed — and the decisions already made. Drop \
-     pleasantries. Write it as notes, in a few sentences, addressed to yourself.";
-
 #[cfg(test)]
 mod tests {
     use serana_domain::reminder::{MonthDays, Recurrence, Reminder, ReminderId, TodoItem, UserId};

@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use serana_app::{AppConfig, Command, Reminders, build_reminders, build_scheduler, respond, text};
+use serana_app::{
+    AppConfig, Calendar, Command, Reminders, Topics, build_reminders, build_scheduler, respond,
+    text,
+};
 use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::UserId;
 use serana_tg::TelegramCommand;
@@ -13,6 +16,10 @@ use teloxide::utils::command::BotCommands;
 
 struct AppState {
     reminders: Reminders,
+    /// `None` when no calendar is configured, which is a supported way to run.
+    calendar: Option<Calendar>,
+    /// What each person was last talking about, so a bare message continues it.
+    topics: Topics,
     telegram: TelegramConfig,
 }
 
@@ -58,11 +65,14 @@ async fn main() -> anyhow::Result<()> {
         allowed = telegram.allowed_users.len(),
         model = %config.model,
         timezone = %config.timezone,
+        calendar = wiring.calendar.is_some(),
         "serana is up"
     );
 
     let state = Arc::new(AppState {
         reminders: wiring.reminders,
+        calendar: wiring.calendar,
+        topics: Topics::new(),
         telegram,
     });
     // Two branches over the same messages: a slash command, or anything else. Without the
@@ -83,6 +93,14 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+/// Who sent this. Channel posts and similar have none, and there is nobody to answer.
+fn sender(message: &Message) -> Option<UserId> {
+    message
+        .from
+        .as_ref()
+        .map(|user| UserId::new(user.id.0 as i64))
 }
 
 /// Send `body` back, logging rather than failing the update if it cannot be delivered.
@@ -109,15 +127,22 @@ async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyh
         reply(&bot, &message, text::UNKNOWN_COMMAND.to_owned()).await;
         return Ok(());
     }
+    let Some(sender) = sender(&message) else {
+        return Ok(());
+    };
+    // A bare "yes" answers the last question asked, and the assistant keeps one
+    // conversation per subject.
+    let last = state.topics.last(sender);
     // A reply is how a person points at something. The message being replied to is very
     // often a delivery the scheduler pushed, which never entered the conversation, so this
-    // is the only way the assistant can know what "this one" refers to.
+    // is the only way the assistant can know what "this one" refers to — and it is aimed at
+    // the conversation that message came from, which need not be the last one they used.
     let command = match message
         .reply_to_message()
         .and_then(|replied| replied.text())
     {
-        Some(quoted) => Command::replying(quoted, &text),
-        None => Command::Reminder(text),
+        Some(quoted) => Command::replying(text::topic_of(quoted).unwrap_or(last), quoted, &text),
+        None => Command::bare(last, &text),
     };
     answer(bot, message, command, state).await
 }
@@ -138,18 +163,17 @@ async fn answer(
     command: Command,
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
-    let Some(sender) = message
-        .from
-        .as_ref()
-        .map(|user| UserId::new(user.id.0 as i64))
-    else {
-        // Channel posts and similar have no sender; there is nobody to answer.
+    let Some(sender) = sender(&message) else {
         return Ok(());
     };
 
     let reply = if state.telegram.allows(sender) {
+        // Noted before the turn, not after: it is where the next bare message goes, and a
+        // turn that fails is still the subject they are on.
+        state.topics.note(sender, &command);
         respond(
             &state.reminders,
+            state.calendar.as_ref(),
             sender,
             &ConversationId::new(format!("tg:{sender}")),
             &command,

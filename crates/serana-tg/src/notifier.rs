@@ -32,7 +32,10 @@ impl Notifier for TelegramNotifier {
         // reminder rather than as the assistant saying something. The wording lives in
         // `serana-app` with every other line the user sees.
         self.bot
-            .send_message(ChatId(owner.get()), serana_app::text::fired(reminder, now))
+            .send_message(
+                ChatId(owner.get()),
+                serana_app::text::reminders::fired(reminder, now),
+            )
             .await
             .map(|_| ())
             .map_err(classify)

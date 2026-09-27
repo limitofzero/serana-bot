@@ -41,7 +41,11 @@ pub fn parse_allowed_users(raw: &str) -> anyhow::Result<HashSet<UserId>> {
             entry
                 .parse::<i64>()
                 .map(UserId::new)
-                .with_context(|| format!("{entry:?} is not a Telegram user id"))
+                // Naming the variable is the whole diagnosis: the value alone leaves
+                // someone reading a crash loop to guess which line of `.env` is wrong.
+                .with_context(|| {
+                    format!("SERANA_ALLOWED_USER_IDS: {entry:?} is not a Telegram user id")
+                })
         })
         .collect()
 }
@@ -49,6 +53,16 @@ pub fn parse_allowed_users(raw: &str) -> anyhow::Result<HashSet<UserId>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_entry_names_the_variable_that_holds_it() {
+        // This surfaces as a crash loop at startup, so the message is the only thing the
+        // person has to go on — it has to say which line of `.env` to look at.
+        let error = parse_allowed_users("notanid").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("SERANA_ALLOWED_USER_IDS"), "{rendered}");
+        assert!(rendered.contains("notanid"), "{rendered}");
+    }
 
     #[test]
     fn an_empty_allowlist_admits_nobody() {

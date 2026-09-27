@@ -5,9 +5,12 @@
 //! client, a database handle or the system clock has broken the layering — cargo enforces
 //! that this crate cannot see `serana-adapters`.
 
+pub mod calendar;
+pub mod chat;
 pub mod reminders;
 
+pub use calendar::{CalendarChat, CalendarOutcome, CalendarService, CalendarTurnError, Planning};
+pub use chat::{Capability, Chat, ChatConfig, DEFAULT_COMPACT_ABOVE_TOKENS, TurnError};
 pub use reminders::{
-    ChatService, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderError, ReminderOutcome,
-    ReminderService, SchedulerService, TickReport,
+    ChatService, ReminderError, ReminderOutcome, ReminderService, SchedulerService, TickReport,
 };

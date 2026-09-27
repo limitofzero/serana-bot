@@ -1,20 +1,25 @@
 //! Turning a [`Command`] into the words to send back.
 //!
-//! No transport, no `Bot`, no terminal — just a service and a string. That is what makes
-//! the command surface testable: the tests below drive the real service against fakes and
+//! No transport, no `Bot`, no terminal — just the services and a string. That is what makes
+//! the command surface testable: the tests below drive the real services against fakes and
 //! assert on exactly what the user would read.
 
+use serana_domain::calendar::{CalendarError, CalendarPort};
 use serana_domain::conversation::ConversationId;
 use serana_domain::conversation_store::ConversationRepository;
 use serana_domain::reminder::{ReminderRepository, UserId};
 use serana_domain::{Clock, IdGenerator, LlmProvider};
-use serana_services::{ChatService, ReminderError};
+use serana_services::{CalendarChat, CalendarTurnError, ChatService, ReminderError};
 
 use crate::{Command, text};
 
 /// Produce the reply for `command`, issued by `user`.
-pub async fn respond<R, L, C, I, V>(
-    service: &ChatService<R, L, C, I, V>,
+///
+/// `calendar` is `None` when none is configured, which is not a failure: the assistant
+/// simply has no calendar, and says so rather than apologising for an outage.
+pub async fn respond<R, L, C, I, V, P>(
+    reminders: &ChatService<R, L, C, I, V>,
+    calendar: Option<&CalendarChat<P, L, C, V>>,
     user: UserId,
     conversation: &ConversationId,
     command: &Command,
@@ -25,28 +30,59 @@ where
     C: Clock,
     I: IdGenerator,
     V: ConversationRepository,
+    P: CalendarPort,
 {
     match command {
         Command::Help => text::HELP.to_owned(),
 
         Command::Reminder(request) if request.trim().is_empty() => {
-            text::REMINDER_NEEDS_TEXT.to_owned()
+            text::reminders::REMINDER_NEEDS_TEXT.to_owned()
         }
-        Command::Reminder(request) => match service.handle(user, conversation, request).await {
-            Ok(outcome) => text::outcome(&outcome),
+        Command::Reminder(request) => match reminders.handle(user, conversation, request).await {
+            Ok(outcome) => text::reminders::outcome(&outcome),
             Err(error) => render_error(&error),
         },
 
-        Command::Compact => match service.compact_conversation(conversation).await {
-            Ok(true) => text::COMPACTED.to_owned(),
-            Ok(false) => text::NOTHING_TO_COMPACT.to_owned(),
+        Command::Reminders => match reminders.reminders().list(user).await {
+            Ok(list) => text::reminders::listing(&list, reminders.reminders().now()),
             Err(error) => render_error(&error),
         },
 
-        Command::Reminders => match service.reminders().list(user).await {
-            Ok(reminders) => text::listing(&reminders, service.reminders().now()),
-            Err(error) => render_error(&error),
-        },
+        Command::Calendar(_) if calendar.is_none() => text::calendar::NOT_CONNECTED.to_owned(),
+        Command::Calendar(request) if request.trim().is_empty() => {
+            text::calendar::CALENDAR_NEEDS_TEXT.to_owned()
+        }
+        Command::Calendar(request) => {
+            let Some(calendar) = calendar else {
+                unreachable!("the arm above answers when there is none")
+            };
+            let zone = calendar.config().default_timezone.clone();
+            match calendar.handle(user, conversation, request).await {
+                Ok(outcome) => text::calendar::outcome(&outcome, &zone),
+                Err(error) => render_calendar_error(&error),
+            }
+        }
+
+        // Both conversations, because the person asked to fold up "this" and has no way to
+        // know the assistant keeps two. Either having had something to say is enough.
+        Command::Compact => {
+            let folded = match reminders.compact_conversation(conversation).await {
+                Ok(folded) => folded,
+                Err(error) => return render_error(&error),
+            };
+            let folded = match calendar {
+                None => folded,
+                Some(calendar) => match calendar.compact_conversation(conversation).await {
+                    Ok(also) => folded || also,
+                    Err(error) => return render_calendar_error(&error),
+                },
+            };
+            if folded {
+                text::COMPACTED.to_owned()
+            } else {
+                text::NOTHING_TO_COMPACT.to_owned()
+            }
+        }
     }
 }
 
@@ -77,26 +113,54 @@ fn render_error(error: &ReminderError) -> String {
     }
 }
 
+/// The same, for the calendar.
+///
+/// "No calendar is connected" is deliberately not an apology: nothing has gone wrong, there
+/// is simply nothing to talk to.
+fn render_calendar_error(error: &CalendarTurnError) -> String {
+    match error {
+        CalendarTurnError::Unparsable(reason) => format!("I did not understand: {reason}"),
+        CalendarTurnError::NotFound(id) => {
+            format!("Event {id} is not on your calendar any more.")
+        }
+        CalendarTurnError::Calendar(CalendarError::NotConnected) => {
+            text::calendar::NOT_CONNECTED.to_owned()
+        }
+        CalendarTurnError::Calendar(error) => {
+            tracing::warn!(%error, "calendar call failed");
+            "Your calendar is not answering right now. Try again in a minute.".to_owned()
+        }
+        CalendarTurnError::Llm(error) => {
+            tracing::warn!(%error, "model call failed");
+            "The model is unavailable right now. Try again in a minute.".to_owned()
+        }
+        CalendarTurnError::Storage(error) => {
+            tracing::error!(%error, "storage failed");
+            "Could not save that. Try again.".to_owned()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use serana_domain::message::ToolCall;
     use serana_domain::reminder::TimeZoneName;
-    use serana_services::{DEFAULT_COMPACT_ABOVE_TOKENS, ReminderConfig, ReminderService};
+    use serana_services::{ChatConfig, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderService};
     use serana_testkit::{
-        FixedClock, InMemoryConversationRepository, InMemoryReminderRepository, ScriptedLlm,
-        SequentialIds,
+        FixedClock, InMemoryCalendar, InMemoryConversationRepository, InMemoryReminderRepository,
+        ScriptedLlm, SequentialIds,
     };
 
     use super::*;
     use crate::text;
 
-    fn chat() -> ConversationId {
+    pub(super) fn chat() -> ConversationId {
         ConversationId::new("test")
     }
 
-    const OWNER: UserId = UserId::new(42);
+    pub(super) const OWNER: UserId = UserId::new(42);
     const OTHER: UserId = UserId::new(7);
 
     type Service = ChatService<
@@ -107,31 +171,52 @@ mod tests {
         InMemoryConversationRepository,
     >;
 
+    /// 10:00 on a Tuesday, in Tbilisi.
+    pub(super) const NOW: &str = "2026-03-10T06:00:00Z";
+    pub(super) const TRAVEL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    pub(super) fn chat_config() -> ChatConfig {
+        ChatConfig {
+            model: "gpt-5-mini".into(),
+            default_timezone: TimeZoneName::new("Asia/Tbilisi"),
+            temperature: None,
+            summary_model: None,
+            compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
+        }
+    }
+
     /// Returns the service and a handle on its scripted model, so a test can assert that
     /// a command did *not* reach the provider.
-    fn service_with_llm(llm: ScriptedLlm) -> (Service, Arc<ScriptedLlm>) {
+    pub(super) fn service_with_llm(llm: ScriptedLlm) -> (Service, Arc<ScriptedLlm>) {
         let llm = Arc::new(llm);
         let service = ChatService::new(
             ReminderService::new(
                 InMemoryReminderRepository::new(),
-                FixedClock::at("2026-03-10T06:00:00Z"),
+                FixedClock::at(NOW),
                 SequentialIds::default(),
             ),
             Arc::clone(&llm),
             InMemoryConversationRepository::new(),
-            ReminderConfig {
-                model: "gpt-5-mini".into(),
-                default_timezone: TimeZoneName::new("Asia/Tbilisi"),
-                temperature: None,
-                summary_model: None,
-                compact_above_tokens: DEFAULT_COMPACT_ABOVE_TOKENS,
-            },
+            chat_config(),
         );
         (service, llm)
     }
 
-    fn service(llm: ScriptedLlm) -> Service {
+    pub(super) fn service(llm: ScriptedLlm) -> Service {
         service_with_llm(llm).0
+    }
+
+    pub(super) type Calendar = CalendarChat<
+        InMemoryCalendar,
+        Arc<ScriptedLlm>,
+        FixedClock,
+        InMemoryConversationRepository,
+    >;
+
+    /// Most of these are about reminders, and a deployment with no calendar configured is a
+    /// real one.
+    fn no_calendar() -> Option<&'static Calendar> {
+        None
     }
 
     fn extracting(times: usize) -> ScriptedLlm {
@@ -151,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn help_explains_the_commands() {
         let service = service(ScriptedLlm::new());
-        let reply = respond(&service, OWNER, &chat(), &Command::Help).await;
+        let reply = respond(&service, no_calendar(), OWNER, &chat(), &Command::Help).await;
         assert!(reply.contains("/reminder"), "{reply}");
     }
 
@@ -160,6 +245,7 @@ mod tests {
         let service = service(extracting(1));
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder(
@@ -182,12 +268,13 @@ mod tests {
         for argument in ["", "   "] {
             let reply = respond(
                 &service,
+                no_calendar(),
                 OWNER,
                 &chat(),
                 &Command::Reminder(argument.into()),
             )
             .await;
-            assert_eq!(reply, text::REMINDER_NEEDS_TEXT);
+            assert_eq!(reply, text::reminders::REMINDER_NEEDS_TEXT);
         }
         assert_eq!(llm.call_count(), 0, "no tokens spent on an empty command");
     }
@@ -196,18 +283,32 @@ mod tests {
     async fn an_empty_list_invites_the_user_to_create_one() {
         let service = service(ScriptedLlm::new());
         assert_eq!(
-            respond(&service, OWNER, &chat(), &Command::Reminders).await,
-            text::NO_REMINDERS
+            respond(&service, no_calendar(), OWNER, &chat(), &Command::Reminders).await,
+            text::reminders::NO_REMINDERS
         );
     }
 
     #[tokio::test]
     async fn a_listing_shows_only_your_own_reminders() {
         let service = service(extracting(2));
-        respond(&service, OWNER, &chat(), &Command::Reminder("мне".into())).await;
-        respond(&service, OTHER, &chat(), &Command::Reminder("им".into())).await;
+        respond(
+            &service,
+            no_calendar(),
+            OWNER,
+            &chat(),
+            &Command::Reminder("мне".into()),
+        )
+        .await;
+        respond(
+            &service,
+            no_calendar(),
+            OTHER,
+            &chat(),
+            &Command::Reminder("им".into()),
+        )
+        .await;
 
-        let reply = respond(&service, OWNER, &chat(), &Command::Reminders).await;
+        let reply = respond(&service, no_calendar(), OWNER, &chat(), &Command::Reminders).await;
         assert_eq!(reply.matches("🆔 ").count(), 1, "{reply}");
         assert!(reply.contains("🆔 r1"), "{reply}");
     }
@@ -220,6 +321,7 @@ mod tests {
         ));
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("что-то".into()),
@@ -228,6 +330,7 @@ mod tests {
 
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("remove it".into()),
@@ -235,8 +338,8 @@ mod tests {
         .await;
         assert!(reply.contains("Deleted"), "{reply}");
         assert_eq!(
-            respond(&service, OWNER, &chat(), &Command::Reminders).await,
-            text::NO_REMINDERS
+            respond(&service, no_calendar(), OWNER, &chat(), &Command::Reminders).await,
+            text::reminders::NO_REMINDERS
         );
     }
 
@@ -280,6 +383,7 @@ mod tests {
         ));
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -288,6 +392,7 @@ mod tests {
 
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("remove the invoice reminder".into()),
@@ -324,6 +429,7 @@ mod tests {
 
         let created = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("pay every month, 1st to 6th".into()),
@@ -333,6 +439,7 @@ mod tests {
 
         let ticked = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("exchanged the money".into()),
@@ -368,6 +475,7 @@ mod tests {
         );
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("pay monthly".into()),
@@ -376,6 +484,7 @@ mod tests {
 
         let done = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("did both of them".into()),
@@ -398,6 +507,7 @@ mod tests {
         ));
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -406,6 +516,7 @@ mod tests {
 
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("done with it".into()),
@@ -422,6 +533,7 @@ mod tests {
         ));
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -430,6 +542,7 @@ mod tests {
 
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("already sent the invoice".into()),
@@ -456,6 +569,7 @@ mod tests {
         ));
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -464,6 +578,7 @@ mod tests {
 
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("make it the 20th to the 26th at 22:30".into()),
@@ -487,6 +602,7 @@ mod tests {
         let service = service(ScriptedLlm::new().answering(question));
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("remove the invoice reminder".into()),
@@ -503,6 +619,7 @@ mod tests {
         ));
         respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -511,6 +628,7 @@ mod tests {
 
         let reply = respond(
             &service,
+            no_calendar(),
             OTHER,
             &chat(),
             &Command::Reminder("remove it".into()),
@@ -533,6 +651,7 @@ mod tests {
         ));
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("remove something".into()),
@@ -549,6 +668,7 @@ mod tests {
         ));
         let reply = respond(
             &service,
+            no_calendar(),
             OWNER,
             &chat(),
             &Command::Reminder("do something".into()),
@@ -556,5 +676,246 @@ mod tests {
         .await;
         // Falls through to prose rather than being treated as an action.
         assert!(!reply.contains("Deleted"), "{reply}");
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use std::sync::Arc;
+
+    use serana_domain::calendar::{CalendarEvent, EventId};
+    use serana_domain::message::ToolCall;
+    use serana_domain::reminder::TimeZoneName;
+    use serana_services::{CalendarService, Chat, Planning};
+    use serana_testkit::{
+        FixedClock, InMemoryCalendar, InMemoryConversationRepository, ScriptedLlm,
+    };
+
+    use super::tests::{
+        Calendar, NOW, OWNER, TRAVEL, chat, chat_config, service, service_with_llm,
+    };
+    use super::*;
+
+    fn event(id: &str, summary: &str, starts_at: &str, ends_at: &str) -> CalendarEvent {
+        CalendarEvent {
+            id: EventId::new(id),
+            summary: summary.into(),
+            starts_at: starts_at.parse().unwrap(),
+            ends_at: ends_at.parse().unwrap(),
+            all_day: false,
+            location: None,
+            mine: true,
+            recurring: false,
+        }
+    }
+
+    fn calendar(llm: Arc<ScriptedLlm>, events: InMemoryCalendar) -> Calendar {
+        Chat::new(
+            Planning::new(CalendarService::new(
+                events,
+                FixedClock::at(NOW),
+                TimeZoneName::new("Asia/Tbilisi"),
+                TRAVEL,
+            )),
+            llm,
+            InMemoryConversationRepository::new(),
+            chat_config(),
+        )
+    }
+
+    fn calling(name: &str, arguments: serde_json::Value) -> Arc<ScriptedLlm> {
+        Arc::new(ScriptedLlm::new().calling(vec![ToolCall::new("c1", name, arguments.to_string())]))
+    }
+
+    #[tokio::test]
+    async fn a_calendar_request_with_none_configured_says_so_rather_than_apologising() {
+        // Nothing has gone wrong: the assistant simply has no calendar.
+        let (service, llm) = service_with_llm(ScriptedLlm::new());
+        let reply = respond(
+            &service,
+            None::<&Calendar>,
+            OWNER,
+            &chat(),
+            &Command::Calendar("what's on?".into()),
+        )
+        .await;
+        assert_eq!(reply, text::calendar::NOT_CONNECTED);
+        assert_eq!(llm.call_count(), 0, "no tokens spent with nothing to ask");
+    }
+
+    #[tokio::test]
+    async fn a_bare_calendar_command_asks_what_for_without_calling_the_model() {
+        let llm = Arc::new(ScriptedLlm::new());
+        let calendar = calendar(Arc::clone(&llm), InMemoryCalendar::new());
+        let service = service(ScriptedLlm::new());
+        for argument in ["", "   "] {
+            let reply = respond(
+                &service,
+                Some(&calendar),
+                OWNER,
+                &chat(),
+                &Command::Calendar(argument.into()),
+            )
+            .await;
+            assert_eq!(reply, text::calendar::CALENDAR_NEEDS_TEXT);
+        }
+        assert_eq!(llm.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn booking_something_in_person_reserves_the_road_and_says_so() {
+        let llm = calling(
+            "create_event",
+            serde_json::json!({
+                "summary": "стоматолог",
+                "date": "2026-03-11",
+                "start_time": "14:00",
+                "end_time": "15:00",
+                "location": "Chavchavadze 1",
+                "in_person": true,
+            }),
+        );
+        let calendar = calendar(Arc::clone(&llm), InMemoryCalendar::new());
+        let reply = respond(
+            &service(ScriptedLlm::new()),
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Calendar("стоматолог завтра в 2".into()),
+        )
+        .await;
+
+        assert!(reply.contains("стоматолог"), "their own words: {reply}");
+        assert!(reply.contains("14:00–15:00"), "the appointment: {reply}");
+        assert!(reply.contains("13:30–15:30"), "the block: {reply}");
+        assert!(reply.contains("Chavchavadze 1"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_invitation_declines_it_and_says_it_is_still_there() {
+        let mut theirs = event(
+            "ev1",
+            "design review",
+            "2026-03-11T10:00:00Z",
+            "2026-03-11T11:00:00Z",
+        );
+        theirs.mine = false;
+        let events = InMemoryCalendar::new().with(theirs);
+        let llm = calling("cancel_event", serde_json::json!({ "id": "ev1" }));
+        let calendar = calendar(Arc::clone(&llm), events);
+
+        let reply = respond(
+            &service(ScriptedLlm::new()),
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Calendar("I am not going to the design review".into()),
+        )
+        .await;
+        assert!(reply.contains("Declined"), "{reply}");
+        assert!(reply.contains("stays on your calendar"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn an_event_the_model_invented_is_reported_rather_than_acted_on() {
+        let llm = calling("cancel_event", serde_json::json!({ "id": "made-up" }));
+        let calendar = calendar(Arc::clone(&llm), InMemoryCalendar::new());
+        let reply = respond(
+            &service(ScriptedLlm::new()),
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Calendar("cancel the dentist".into()),
+        )
+        .await;
+        assert!(reply.contains("made-up"), "{reply}");
+        assert!(reply.contains("not on your calendar"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn the_question_asked_before_a_delete_reaches_the_user_verbatim() {
+        // Deleting is the one irreversible action here, and the model is told to ask first.
+        // Its question is the whole reply: paraphrasing it would lose what is being deleted.
+        let question = "Delete “design review” on 11 March for good? This cannot be undone.";
+        let llm = Arc::new(ScriptedLlm::new().answering(question));
+        let calendar = calendar(
+            Arc::clone(&llm),
+            InMemoryCalendar::new().with(event(
+                "ev1",
+                "design review",
+                "2026-03-11T10:00:00Z",
+                "2026-03-11T11:00:00Z",
+            )),
+        );
+        let reply = respond(
+            &service(ScriptedLlm::new()),
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Calendar("delete the design review".into()),
+        )
+        .await;
+        assert_eq!(reply, question);
+    }
+
+    #[tokio::test]
+    async fn a_calendar_that_is_down_is_not_reported_as_a_misunderstanding() {
+        let events = InMemoryCalendar::broken(CalendarError::Unavailable("503".into()));
+        let llm = Arc::new(ScriptedLlm::new());
+        let calendar = calendar(Arc::clone(&llm), events);
+        let reply = respond(
+            &service(ScriptedLlm::new()),
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Calendar("what's on?".into()),
+        )
+        .await;
+        assert!(reply.contains("not answering"), "{reply}");
+        assert_eq!(llm.call_count(), 0, "the week is read before the model is");
+    }
+
+    #[tokio::test]
+    async fn folding_up_with_nothing_said_anywhere_says_there_was_nothing_to_fold() {
+        let llm = Arc::new(ScriptedLlm::new());
+        let calendar = calendar(Arc::clone(&llm), InMemoryCalendar::new());
+        let reply = respond(
+            &service(ScriptedLlm::new()),
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Compact,
+        )
+        .await;
+        assert_eq!(reply, text::NOTHING_TO_COMPACT);
+    }
+
+    #[tokio::test]
+    async fn folding_up_covers_the_calendar_conversation_too() {
+        // The person asked to fold "this" up, and has no way to know there are two.
+        let llm = Arc::new(
+            ScriptedLlm::new()
+                .calling(vec![ToolCall::new(
+                    "c1",
+                    "list_events",
+                    serde_json::json!({ "from": "2026-03-11", "to": "2026-03-11" }).to_string(),
+                )])
+                .answering("they asked what was on"),
+        );
+        let calendar = calendar(Arc::clone(&llm), InMemoryCalendar::new());
+        let service = service(ScriptedLlm::new());
+
+        respond(
+            &service,
+            Some(&calendar),
+            OWNER,
+            &chat(),
+            &Command::Calendar("what's on tomorrow?".into()),
+        )
+        .await;
+        let reply = respond(&service, Some(&calendar), OWNER, &chat(), &Command::Compact).await;
+
+        assert_eq!(reply, text::COMPACTED);
+        assert_eq!(llm.remaining(), 0, "the summary call happened");
     }
 }

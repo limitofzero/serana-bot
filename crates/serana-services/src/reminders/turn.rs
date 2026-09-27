@@ -1,32 +1,26 @@
-//! One turn of conversation about reminders.
+//! A conversation about reminders.
 //!
-//! This is where the model lives: the conversation is loaded, the request is put to the
-//! provider with a toolset, whatever it chose is dispatched to [`ReminderService`], and the
-//! exchange is written back. It knows how a request arrives and what to do with the answer;
-//! it knows nothing about what a reminder *is*.
-
-use std::sync::Arc;
+//! [`ChatService`] is the shared conversation loop with the reminder capability fitted to
+//! it. The loop — history, alternation, compaction — lives in [`crate::chat`]; what a
+//! reminder tool does lives in [`super::capability`]. This is only the seam between them,
+//! and the name the frontends know it by.
 
 use serana_domain::conversation::{Conversation, ConversationId};
 use serana_domain::conversation_store::ConversationRepository;
-use serana_domain::llm::{CompletionRequest, CompletionResponse, LlmProvider};
-use serana_domain::message::Message;
-use serana_domain::reminder::{ReminderId, ReminderRepository, TimeZoneName, UserId};
-use serana_domain::{Clock, IdGenerator, StorageError};
+use serana_domain::llm::LlmProvider;
+use serana_domain::reminder::{ReminderRepository, UserId};
+use serana_domain::{Clock, IdGenerator};
 
-use super::config::ReminderConfig;
+use crate::chat::{Chat, ChatConfig};
+
+use super::capability::Reminding;
 use super::error::ReminderError;
-use super::outcome::{ReminderOutcome, summarise};
-use super::parse::ParsedReminder;
+use super::outcome::ReminderOutcome;
 use super::service::ReminderService;
-use super::{prompt, tools};
 
 /// A conversation about reminders.
 pub struct ChatService<R, L, C, I, V> {
-    reminders: ReminderService<R, C, I>,
-    llm: L,
-    conversations: V,
-    config: ReminderConfig,
+    pub(crate) chat: Chat<Reminding<R, C, I>, L, V>,
 }
 
 impl<R, L, C, I, V> ChatService<R, L, C, I, V>
@@ -41,20 +35,23 @@ where
         reminders: ReminderService<R, C, I>,
         llm: L,
         conversations: V,
-        config: ReminderConfig,
+        config: ChatConfig,
     ) -> Self {
+        let timezone = config.default_timezone.clone();
         Self {
-            reminders,
-            llm,
-            conversations,
-            config,
+            chat: Chat::new(
+                Reminding::new(reminders, timezone),
+                llm,
+                conversations,
+                config,
+            ),
         }
     }
 
     /// The reminders underneath. Listing and the clock come from here; the frontend needs
     /// both and neither is a conversation concern.
     pub fn reminders(&self) -> &ReminderService<R, C, I> {
-        &self.reminders
+        self.chat.capability().reminders()
     }
 
     /// Give up the reminders, so another conversation can be had over the same storage.
@@ -62,7 +59,7 @@ where
     /// A turn is one model call, so a test covering two turns needs two chat services over
     /// one set of reminders. Consuming rather than cloning keeps that explicit.
     pub fn into_reminders(self) -> ReminderService<R, C, I> {
-        self.reminders
+        self.chat.into_capability().into_reminders()
     }
 
     pub async fn handle(
@@ -71,116 +68,7 @@ where
         conversation: &ConversationId,
         request: &str,
     ) -> Result<ReminderOutcome, ReminderError> {
-        if request.trim().is_empty() {
-            return Err(ReminderError::Unparsable("the request is empty".into()));
-        }
-
-        let now = self.reminders.now();
-        let timezone = self.config.default_timezone.clone();
-        let local = now.to_zoned(timezone.resolve()?);
-        let existing = self.reminders.list_all(owner).await?;
-
-        let mut history = self
-            .conversations
-            .load(conversation)
-            .await?
-            .unwrap_or_else(|| Conversation::new(conversation.clone(), prompt::INSTRUCTIONS, now));
-
-        history
-            .push_user(format!(
-                "{}\n{request}",
-                prompt::context(&local, &timezone, &existing, now)
-            ))
-            .map_err(|e| ReminderError::Storage(StorageError::Corrupt(e.to_string())))?;
-
-        let response = self.ask(&history).await?;
-
-        // A name we do not offer is a hallucination, not an action: fall through to the
-        // model's own prose rather than dispatching something we cannot check.
-        let chosen = response
-            .tool_calls
-            .iter()
-            .find(|call| tools::is_known(&call.name))
-            .cloned();
-
-        let outcome = match chosen {
-            None => ReminderOutcome::Said(
-                response
-                    .content
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .unwrap_or("I could not work out what you wanted there.")
-                    .to_owned(),
-            ),
-            Some(call) => {
-                let arguments = call.parse_arguments().map_err(|e| {
-                    ReminderError::Unparsable(format!("the answer came back malformed: {e}"))
-                })?;
-                self.dispatch(owner, now, &timezone, &call.name, arguments)
-                    .await?
-            }
-        };
-
-        self.record(&mut history, &response, &outcome)?;
-
-        // Compaction is the one sanctioned cache break, so it happens as late as possible:
-        // only once the provider says the history it is re-reading has grown past the
-        // threshold. `prompt_tokens` is the provider's own count, so there is no tokenizer
-        // to take on and no estimate to be wrong about.
-        if response.usage.prompt_tokens > self.config.compact_above_tokens {
-            self.compact(&mut history).await?;
-        }
-
-        self.conversations.save(&history).await?;
-        Ok(outcome)
-    }
-
-    /// Ask the model, with the whole conversation in front of it.
-    async fn ask(&self, history: &Conversation) -> Result<CompletionResponse, ReminderError> {
-        let mut call = CompletionRequest::new(
-            &self.config.model,
-            Arc::from(history.system_prompt()),
-            history.messages().to_vec(),
-        )
-        .with_tools(tools::specs());
-        if let Some(temperature) = self.config.temperature {
-            call = call.with_temperature(temperature);
-        }
-        Ok(self.llm.complete(call).await?)
-    }
-
-    /// Append what the model said, and what came of it, to the history.
-    ///
-    /// A tool call must be followed by exactly one result, on every path — leave one open
-    /// and the next turn starts `tool -> user`, which providers reject.
-    fn record(
-        &self,
-        history: &mut Conversation,
-        response: &CompletionResponse,
-        outcome: &ReminderOutcome,
-    ) -> Result<(), ReminderError> {
-        let corrupt = |e: serana_domain::AlternationError| {
-            ReminderError::Storage(StorageError::Corrupt(e.to_string()))
-        };
-
-        match outcome {
-            ReminderOutcome::Said(words) => history.push_assistant(words).map_err(corrupt),
-            _ => {
-                let calls = response.tool_calls.clone();
-                let Some(first) = calls.first().cloned() else {
-                    return Ok(());
-                };
-                history.push_tool_calls(calls).map_err(corrupt)?;
-                history
-                    .push_tool_result(&first.id, summarise(outcome))
-                    .map_err(corrupt)?;
-                // Anything the model asked for beyond the first call was never run; closing
-                // them keeps the alternation legal and tells the model why.
-                history.close_open_tool_calls("not run: one action per turn");
-                Ok(())
-            }
-        }
+        self.chat.handle(owner, conversation, request).await
     }
 
     /// Summarise a stored conversation in place, at the user's request.
@@ -190,177 +78,39 @@ where
         &self,
         conversation: &ConversationId,
     ) -> Result<bool, ReminderError> {
-        let Some(mut history) = self.conversations.load(conversation).await? else {
-            return Ok(false);
-        };
-        if history.is_empty() {
-            return Ok(false);
-        }
-        self.compact(&mut history).await?;
-        self.conversations.save(&history).await?;
-        Ok(true)
+        self.chat.compact_conversation(conversation).await
     }
 
-    /// Replace the history with a summary of itself, keeping the system prompt.
-    ///
-    /// Triggered by [`ReminderConfig::compact_above_tokens`], or by the user asking. The
-    /// summary arrives as a user message with an assistant acknowledgement after it, so the
-    /// conversation is left able to accept the next user message.
+    /// Replace a history with a summary of itself, keeping the system prompt.
     pub async fn compact(&self, history: &mut Conversation) -> Result<(), ReminderError> {
-        if history.is_empty() {
-            return Ok(());
-        }
-
-        let transcript = history
-            .messages()
-            .iter()
-            .map(|message| match message {
-                Message::User { content } => format!("them: {content}"),
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                } => match content {
-                    Some(text) => format!("you: {text}"),
-                    None => format!(
-                        "you: (called {})",
-                        tool_calls
-                            .iter()
-                            .map(|c| c.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                },
-                Message::Tool { content, .. } => format!("result: {content}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let summary = self
-            .llm
-            .complete(CompletionRequest::new(
-                self.config.summary_model(),
-                Arc::from(prompt::SUMMARISE),
-                vec![Message::user(transcript)],
-            ))
-            .await?
-            .content
-            .unwrap_or_default();
-
-        let corrupt = |e: serana_domain::AlternationError| {
-            ReminderError::Storage(StorageError::Corrupt(e.to_string()))
-        };
-
-        // Same id, same system prompt, same creation time: it is the same conversation,
-        // with its middle replaced.
-        let mut compacted = Conversation::new(
-            history.id().clone(),
-            history.system_prompt(),
-            history.created_at(),
-        );
-        compacted
-            .push_user(format!(
-                "Notes on our earlier conversation:\n{}",
-                summary.trim()
-            ))
-            .map_err(corrupt)?;
-        compacted.push_assistant("Noted.").map_err(corrupt)?;
-        *history = compacted;
-        Ok(())
+        self.chat.compact(history).await
     }
 
-    /// Run the action the model chose.
-    async fn dispatch(
+    /// This conversation's stored history for `base`, if there is one.
+    #[cfg(test)]
+    pub(crate) async fn stored(
         &self,
-        owner: UserId,
-        now: jiff::Timestamp,
-        timezone: &TimeZoneName,
-        name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<ReminderOutcome, ReminderError> {
-        let incomplete = |e| ReminderError::Unparsable(format!("the answer was incomplete: {e}"));
-
-        match name {
-            tools::CREATE => {
-                let parsed: ParsedReminder =
-                    serde_json::from_value(arguments).map_err(incomplete)?;
-                let (recurrence, text, items) = parsed.into_recurrence()?;
-                Ok(ReminderOutcome::Created {
-                    reminder: self
-                        .reminders
-                        .create(owner, now, timezone.clone(), recurrence, text, items)
-                        .await?,
-                    at: now,
-                })
-            }
-            tools::UPDATE => {
-                let args: tools::UpdateArgs =
-                    serde_json::from_value(arguments).map_err(incomplete)?;
-                let (recurrence, text, items) = args.schedule.into_recurrence()?;
-                Ok(ReminderOutcome::Updated {
-                    reminder: self
-                        .reminders
-                        .update(
-                            owner,
-                            &ReminderId::new(args.id.trim()),
-                            recurrence,
-                            text,
-                            items,
-                            now,
-                        )
-                        .await?,
-                    at: now,
-                })
-            }
-            tools::DELETE => {
-                let args: tools::TargetArgs =
-                    serde_json::from_value(arguments).map_err(incomplete)?;
-                Ok(ReminderOutcome::Deleted(
-                    self.reminders
-                        .delete(owner, &ReminderId::new(args.id.trim()))
-                        .await?,
-                ))
-            }
-            tools::COMPLETE => {
-                let args: tools::CompleteArgs =
-                    serde_json::from_value(arguments).map_err(incomplete)?;
-                let (reminder, ticked) = self
-                    .reminders
-                    .complete_items(owner, &ReminderId::new(args.id.trim()), &args.items, now)
-                    .await?;
-                Ok(ReminderOutcome::Completed {
-                    reminder,
-                    ticked,
-                    at: now,
-                })
-            }
-            tools::ACKNOWLEDGE => {
-                let args: tools::TargetArgs =
-                    serde_json::from_value(arguments).map_err(incomplete)?;
-                Ok(ReminderOutcome::Acknowledged(
-                    self.reminders
-                        .acknowledge(owner, &ReminderId::new(args.id.trim()))
-                        .await?,
-                ))
-            }
-            // `is_known` gates the caller, so reaching here means the two lists disagree.
-            other => Err(ReminderError::Unparsable(format!(
-                "I do not know how to {other}"
-            ))),
-        }
+        base: &ConversationId,
+    ) -> Result<Option<Conversation>, serana_domain::StorageError> {
+        self.chat.stored(base).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use serana_domain::message::{Message, ToolCall, Usage};
-    use serana_domain::reminder::{MonthDays, Recurrence, Reminder, TodoItem, WeekDays, Weekday};
+    use serana_domain::reminder::{
+        MonthDays, Recurrence, Reminder, ReminderId, TimeZoneName, TodoItem, WeekDays, Weekday,
+    };
     use serana_domain::{CompletionResponse, LlmError};
     use serana_testkit::{
         FixedClock, InMemoryConversationRepository, InMemoryReminderRepository, ScriptedLlm,
         SequentialIds,
     };
 
-    use super::super::config::DEFAULT_COMPACT_ABOVE_TOKENS;
+    use crate::chat::DEFAULT_COMPACT_ABOVE_TOKENS;
+    use crate::reminders::{prompt, tools};
+
     use super::*;
 
     const OWNER: UserId = UserId::new(42);
@@ -374,8 +124,8 @@ mod tests {
         InMemoryConversationRepository,
     >;
 
-    fn config() -> ReminderConfig {
-        ReminderConfig {
+    fn config() -> ChatConfig {
+        ChatConfig {
             model: "gpt-5-mini".into(),
             default_timezone: TimeZoneName::new("Asia/Tbilisi"),
             temperature: None,
@@ -484,17 +234,17 @@ mod tests {
         create(&service, OWNER, "every month on the 20th")
             .await
             .unwrap();
-        assert_eq!(service.llm.requests()[0].temperature, None);
+        assert_eq!(service.chat.llm.requests()[0].temperature, None);
     }
 
     #[tokio::test]
     async fn a_configured_temperature_is_sent_through() {
         let mut service = service(extracting(monthly_invoice()));
-        service.config.temperature = Some(0.0);
+        service.chat.config.temperature = Some(0.0);
         create(&service, OWNER, "every month on the 20th")
             .await
             .unwrap();
-        assert_eq!(service.llm.requests()[0].temperature, Some(0.0));
+        assert_eq!(service.chat.llm.requests()[0].temperature, Some(0.0));
     }
 
     #[tokio::test]
@@ -533,7 +283,7 @@ mod tests {
         );
 
         // The second call carried the first exchange, which is why the answer resolved.
-        let second = &service.llm.requests()[1];
+        let second = &service.chat.llm.requests()[1];
         assert_eq!(second.messages.len(), 3, "user, assistant, user");
         assert!(
             matches!(&second.messages[1], Message::Assistant { content: Some(c), .. }
@@ -554,7 +304,7 @@ mod tests {
             .await
             .unwrap();
 
-        let second = &service.llm.requests()[1];
+        let second = &service.chat.llm.requests()[1];
         assert_eq!(second.messages.len(), 1, "a fresh conversation: {second:?}");
     }
 
@@ -565,7 +315,7 @@ mod tests {
         let service = service(extracting(monthly_invoice()));
         create(&service, OWNER, "каждый месяц 20").await.unwrap();
 
-        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        let stored = service.stored(&chat()).await.unwrap().unwrap();
         assert!(stored.pending_tool_calls().is_empty(), "{stored:?}");
         assert!(matches!(
             stored.messages().last(),
@@ -591,7 +341,7 @@ mod tests {
         service.handle(OWNER, &chat(), "first").await.unwrap();
         assert!(service.handle(OWNER, &chat(), "second").await.is_err());
 
-        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        let stored = service.stored(&chat()).await.unwrap().unwrap();
         assert_eq!(stored.len(), 2, "no orphaned user message: {stored:?}");
     }
 
@@ -608,7 +358,7 @@ mod tests {
             .unwrap();
 
         assert!(service.compact_conversation(&chat()).await.unwrap());
-        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        let stored = service.stored(&chat()).await.unwrap().unwrap();
 
         assert_eq!(stored.len(), 2, "a summary and an acknowledgement");
         assert!(
@@ -617,7 +367,9 @@ mod tests {
         );
         // Same conversation, so the cache-stable half is untouched.
         assert_eq!(stored.system_prompt(), prompt::INSTRUCTIONS);
-        assert_eq!(stored.id(), &chat());
+        // Same conversation — the id is the caller's, branched by subject so the calendar
+        // never inherits this history or its prompt.
+        assert_eq!(stored.id(), &ConversationId::new("test:reminders"));
         // And it can still take the next message.
         assert_eq!(stored.tail(), serana_domain::Tail::Assistant);
     }
@@ -644,10 +396,10 @@ mod tests {
                 .answering("summary of everything"),
         );
         // Below the reported count, so the turn trips it.
-        service.config.compact_above_tokens = 1_000;
+        service.chat.config.compact_above_tokens = 1_000;
 
         service.handle(OWNER, &chat(), "first").await.unwrap();
-        let stored = service.conversations.load(&chat()).await.unwrap().unwrap();
+        let stored = service.stored(&chat()).await.unwrap().unwrap();
         assert_eq!(stored.len(), 2, "folded up straight away: {stored:?}");
         assert!(format!("{:?}", stored.messages()).contains("summary of everything"));
     }
@@ -1169,7 +921,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request = &service.llm.requests()[0];
+        let request = &service.chat.llm.requests()[0];
 
         // The moment rides the user message. Putting it in the system prompt would change
         // that prompt on every turn and cost the provider's prompt cache — the whole reason
@@ -1221,7 +973,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            service.llm.call_count(),
+            service.chat.llm.call_count(),
             0,
             "no tokens spent on an empty request"
         );

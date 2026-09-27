@@ -17,6 +17,8 @@ pub enum TelegramCommand {
     Reminder(String),
     /// List your reminders.
     Reminders,
+    /// Your calendar — what is on, book something, call something off.
+    Calendar(String),
     /// Fold this conversation up into a summary.
     Compact,
 }
@@ -28,6 +30,7 @@ impl From<TelegramCommand> for Command {
             TelegramCommand::Help | TelegramCommand::Start => Self::Help,
             TelegramCommand::Reminder(request) => Self::Reminder(request),
             TelegramCommand::Reminders => Self::Reminders,
+            TelegramCommand::Calendar(request) => Self::Calendar(request),
             TelegramCommand::Compact => Self::Compact,
         }
     }
@@ -63,7 +66,14 @@ mod tests {
             .collect();
         assert_eq!(
             registered,
-            vec!["/help", "/start", "/reminder", "/reminders", "/compact"]
+            vec![
+                "/help",
+                "/start",
+                "/reminder",
+                "/reminders",
+                "/calendar",
+                "/compact"
+            ]
         );
     }
 
@@ -83,7 +93,7 @@ mod tests {
     fn the_commands_telegram_advertises_are_the_ones_users_are_told_about() {
         // `descriptions()` is what /help in Telegram's own menu shows.
         let advertised = TelegramCommand::descriptions().to_string();
-        for command in ["/reminder", "/reminders", "/help"] {
+        for command in ["/reminder", "/reminders", "/calendar", "/help"] {
             assert!(
                 advertised.contains(command),
                 "{command} is missing from {advertised}"
