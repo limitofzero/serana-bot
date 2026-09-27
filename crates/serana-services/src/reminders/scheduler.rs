@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use serana_domain::reminder::{Notifier, NotifyError, Reminder, ReminderRepository};
-use serana_domain::{Clock, StorageError};
+use serana_domain::reminder::{Notifier, Reminder, ReminderRepository};
+use serana_domain::{Clock, NotifyError, StorageError};
 
 /// What one [`SchedulerService::tick`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -19,6 +19,7 @@ pub mod ids;
 pub mod llm;
 pub mod memory;
 pub mod message;
+pub mod prices;
 pub mod reminder;
 pub mod retrieval;
 pub mod tool;
@@ -27,16 +28,19 @@ pub use calendar::{CalendarError, CalendarEvent, CalendarPort, Cancellation, Eve
 pub use clock::Clock;
 pub use conversation::{AlternationError, Conversation, ConversationId, Tail};
 pub use conversation_store::ConversationRepository;
-pub use error::{LlmError, RetrievalError, StorageError, ToolError};
+pub use error::{LlmError, NotifyError, RetrievalError, StorageError, ToolError};
 pub use ids::IdGenerator;
 pub use llm::{CompletionRequest, CompletionResponse, FinishReason, LlmProvider};
 pub use memory::{
     MemoryId, MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository, MemorySummary, ScoredMemory,
 };
 pub use message::{Message, ToolCall, ToolCallId, Usage};
+pub use prices::{
+    AssetId, Digest, DigestNotifier, DigestRepository, PriceError, PriceSource, Quote, Snapshot,
+};
 pub use reminder::{
-    InvalidDays, MonthDays, Notifier, NotifyError, Recurrence, Reminder, ReminderId,
-    ReminderRepository, TimeZoneName, UserId, WeekDays, Weekday,
+    InvalidDays, MonthDays, Notifier, Recurrence, Reminder, ReminderId, ReminderRepository,
+    TimeZoneName, UserId, WeekDays, Weekday,
 };
 pub use retrieval::{Embedding, EmbeddingProvider, Passage, Retriever};
 pub use tool::{Tool, ToolRegistry, ToolSpec};

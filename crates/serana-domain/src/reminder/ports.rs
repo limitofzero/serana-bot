@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::StorageError;
+use crate::error::{NotifyError, StorageError};
 
 use super::entry::Reminder;
 use super::id::{ReminderId, UserId};
@@ -46,17 +46,6 @@ pub trait Notifier: Send + Sync {
         reminder: &Reminder,
         now: jiff::Timestamp,
     ) -> Result<(), NotifyError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum NotifyError {
-    /// The user cannot be reached and never will be — blocked the bot, deleted the chat.
-    /// The scheduler deactivates reminders rather than retrying these forever.
-    #[error("recipient unreachable: {0}")]
-    Unreachable(String),
-
-    #[error("delivery failed: {0}")]
-    Transport(String),
 }
 
 #[async_trait]

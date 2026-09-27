@@ -12,6 +12,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use serana_domain::StorageError;
+
+use crate::sqlite::{backend, open_pool, to_nanos};
 use serana_domain::conversation::{Conversation, ConversationId};
 use serana_domain::conversation_store::ConversationRepository;
 
@@ -47,22 +49,10 @@ impl SqliteConversationRepository {
         options: SqliteConnectOptions,
         pool_options: SqlitePoolOptions,
     ) -> Result<Self, StorageError> {
-        let pool = pool_options.connect_with(options).await.map_err(backend)?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| StorageError::Backend(format!("migrations failed: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool: open_pool(options, pool_options).await?,
+        })
     }
-}
-
-fn backend(error: impl std::fmt::Display) -> StorageError {
-    StorageError::Backend(error.to_string())
-}
-
-fn to_nanos(at: jiff::Timestamp) -> Result<i64, StorageError> {
-    i64::try_from(at.as_nanosecond())
-        .map_err(|_| StorageError::Backend(format!("{at} does not fit in an i64 of nanoseconds")))
 }
 
 #[async_trait]

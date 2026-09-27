@@ -8,13 +8,16 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use serana_adapters::{
-    GoogleCalendar, OpenAiConfig, OpenAiProvider, RandomIds, SqliteConversationRepository,
-    SqliteReminderRepository, SystemClock,
+    Chain, CoinGecko, DefiLlama, DefiLlamaConfig, GoogleCalendar, OpenAiConfig, OpenAiProvider,
+    RandomIds, SqliteConversationRepository, SqliteDigestRepository, SqliteReminderRepository,
+    SystemClock,
 };
+use serana_domain::prices::DigestNotifier;
 use serana_domain::reminder::Notifier;
 use serana_services::{
     CalendarChat, CalendarService, Chat, ChatConfig, ChatService, DEFAULT_COMPACT_ABOVE_TOKENS,
-    Planning, ReminderService, SchedulerService,
+    DigestScheduler, Planning, PriceChat, PriceConfig, PriceService, ReminderService,
+    SchedulerService, Watching,
 };
 
 use crate::AppConfig;
@@ -32,6 +35,21 @@ pub type Reminders = ChatService<
 pub type Calendar =
     CalendarChat<GoogleCalendar, Arc<OpenAiProvider>, SystemClock, SqliteConversationRepository>;
 
+/// Where prices come from: CoinGecko, falling back to DefiLlama.
+///
+/// Shared between the conversation and the scheduler, so both report the same source and a
+/// fallback is visible wherever it happened.
+pub type Prices = Arc<Chain>;
+
+/// The prices conversation, with every port resolved.
+pub type Digest = PriceChat<
+    Prices,
+    SqliteDigestRepository,
+    Arc<OpenAiProvider>,
+    SystemClock,
+    SqliteConversationRepository,
+>;
+
 /// What a frontend gets after wiring.
 pub struct Wiring {
     /// Kept so the frontend can build a scheduler over the same database.
@@ -39,6 +57,11 @@ pub struct Wiring {
     pub reminders: Reminders,
     /// `None` when no calendar is configured, which is a supported way to run.
     pub calendar: Option<Calendar>,
+    pub prices: Digest,
+    /// Kept so the frontend can build a digest scheduler over the same store and source.
+    pub digests: SqliteDigestRepository,
+    pub price_source: Prices,
+    pub price_config: PriceConfig,
 }
 
 /// Open the database and assemble the services.
@@ -77,11 +100,56 @@ pub async fn build_reminders(config: &AppConfig) -> anyhow::Result<Wiring> {
         chat_config.clone(),
     );
 
+    let digests = SqliteDigestRepository::open(config.database_path())
+        .await
+        .with_context(|| format!("could not open {}", config.database_path().display()))?;
+
+    // CoinGecko first: it is the only one of the two that reports a 24-hour move. DefiLlama
+    // behind it, because a once-a-day message that silently fails is not noticed for a day.
+    let price_source: Prices = Arc::new(Chain::new(vec![
+        Box::new(CoinGecko::new(config.coingecko.clone())?),
+        Box::new(DefiLlama::new(DefiLlamaConfig::default())?),
+    ]));
+    let price_config = PriceConfig::daily(config.assets.clone(), config.timezone.clone());
+
+    let prices = Chat::new(
+        Watching::new(PriceService::new(
+            Arc::clone(&price_source),
+            digests.clone(),
+            SystemClock,
+            price_config.clone(),
+        )),
+        Arc::clone(&provider),
+        conversations.clone(),
+        chat_config.clone(),
+    );
+
     Ok(Wiring {
         repository,
         reminders,
         calendar: build_calendar(config, provider, conversations, chat_config),
+        prices,
+        digests,
+        price_source,
+        price_config,
     })
+}
+
+/// A digest scheduler over the same store and the same source.
+///
+/// A second loop beside the reminder one: they share a shape and nothing else, and the
+/// reminder loop works.
+pub fn build_digest_scheduler<N: DigestNotifier>(
+    wiring: &Wiring,
+    notifier: N,
+) -> DigestScheduler<SqliteDigestRepository, Prices, N, SystemClock> {
+    DigestScheduler::new(
+        wiring.digests.clone(),
+        Arc::clone(&wiring.price_source),
+        notifier,
+        SystemClock,
+        wiring.price_config.clone(),
+    )
 }
 
 /// The calendar conversation, if there is a calendar to have one about.

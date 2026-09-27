@@ -16,4 +16,7 @@ pub use command::{Command, Topic};
 pub use config::AppConfig;
 pub use respond::respond;
 pub use topics::Topics;
-pub use wiring::{Calendar, Reminders, Wiring, build_reminders, build_scheduler};
+pub use wiring::{
+    Calendar, Digest, Prices, Reminders, Wiring, build_digest_scheduler, build_reminders,
+    build_scheduler,
+};

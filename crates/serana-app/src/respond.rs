@@ -7,9 +7,13 @@
 use serana_domain::calendar::{CalendarError, CalendarPort};
 use serana_domain::conversation::ConversationId;
 use serana_domain::conversation_store::ConversationRepository;
+use serana_domain::prices::{DigestRepository, PriceSource};
 use serana_domain::reminder::{ReminderRepository, UserId};
 use serana_domain::{Clock, IdGenerator, LlmProvider};
-use serana_services::{CalendarChat, CalendarTurnError, ChatService, ReminderError};
+use serana_services::{
+    CalendarChat, CalendarTurnError, ChatService, PriceChat, PriceOutcome, PriceTurnError,
+    ReminderError,
+};
 
 use crate::{Command, text};
 
@@ -17,9 +21,10 @@ use crate::{Command, text};
 ///
 /// `calendar` is `None` when none is configured, which is not a failure: the assistant
 /// simply has no calendar, and says so rather than apologising for an outage.
-pub async fn respond<R, L, C, I, V, P>(
+pub async fn respond<R, L, C, I, V, P, S, D>(
     reminders: &ChatService<R, L, C, I, V>,
     calendar: Option<&CalendarChat<P, L, C, V>>,
+    prices: &PriceChat<S, D, L, C, V>,
     user: UserId,
     conversation: &ConversationId,
     command: &Command,
@@ -31,6 +36,8 @@ where
     I: IdGenerator,
     V: ConversationRepository,
     P: CalendarPort,
+    S: PriceSource,
+    D: DigestRepository,
 {
     match command {
         Command::Help => text::HELP.to_owned(),
@@ -63,20 +70,46 @@ where
             }
         }
 
-        // Both conversations, because the person asked to fold up "this" and has no way to
-        // know the assistant keeps two. Either having had something to say is enough.
+        // A bare `/prices` means "show me the digest" and nothing else, so it skips the
+        // model entirely — the same bargain `/reminders` makes. It is the most common thing
+        // anyone will send here, and it should cost no tokens and never be misread.
+        Command::Prices(request) if request.trim().is_empty() => {
+            let service = prices.capability().prices();
+            match service.show(user, false).await {
+                Ok((digest, snapshot, read_now)) => text::prices::outcome(
+                    &PriceOutcome::Showed {
+                        digest,
+                        snapshot,
+                        read_now,
+                    },
+                    service.now(),
+                ),
+                Err(error) => render_price_error(&error),
+            }
+        }
+        Command::Prices(request) => match prices.handle(user, conversation, request).await {
+            Ok(outcome) => text::prices::outcome(&outcome, prices.capability().prices().now()),
+            Err(error) => render_price_error(&error),
+        },
+
+        // Every conversation, because the person asked to fold up "this" and has no way to
+        // know the assistant keeps one per subject. Any of them having had something to
+        // say is enough.
         Command::Compact => {
-            let folded = match reminders.compact_conversation(conversation).await {
+            let mut folded = match reminders.compact_conversation(conversation).await {
                 Ok(folded) => folded,
                 Err(error) => return render_error(&error),
             };
-            let folded = match calendar {
-                None => folded,
-                Some(calendar) => match calendar.compact_conversation(conversation).await {
-                    Ok(also) => folded || also,
+            if let Some(calendar) = calendar {
+                match calendar.compact_conversation(conversation).await {
+                    Ok(also) => folded |= also,
                     Err(error) => return render_calendar_error(&error),
-                },
-            };
+                }
+            }
+            match prices.compact_conversation(conversation).await {
+                Ok(also) => folded |= also,
+                Err(error) => return render_price_error(&error),
+            }
             if folded {
                 text::COMPACTED.to_owned()
             } else {
@@ -141,16 +174,39 @@ fn render_calendar_error(error: &CalendarTurnError) -> String {
     }
 }
 
+/// The same, for prices.
+///
+/// A market that cannot be read is not the person's problem and not their phrasing, so it
+/// is named as what it is rather than as a misunderstanding.
+fn render_price_error(error: &PriceTurnError) -> String {
+    match error {
+        PriceTurnError::Unparsable(reason) => format!("I did not understand: {reason}"),
+        PriceTurnError::Market(error) => {
+            tracing::warn!(%error, "could not read prices");
+            text::prices::NO_MARKET.to_owned()
+        }
+        PriceTurnError::Llm(error) => {
+            tracing::warn!(%error, "model call failed");
+            "The model is unavailable right now. Try again in a minute.".to_owned()
+        }
+        PriceTurnError::Storage(error) => {
+            tracing::error!(%error, "storage failed");
+            "Could not save that. Try again.".to_owned()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use serana_domain::message::ToolCall;
     use serana_domain::reminder::TimeZoneName;
+    use serana_services::{Chat, PriceConfig, PriceService, Watching};
     use serana_services::{ChatConfig, DEFAULT_COMPACT_ABOVE_TOKENS, ReminderService};
     use serana_testkit::{
-        FixedClock, InMemoryCalendar, InMemoryConversationRepository, InMemoryReminderRepository,
-        ScriptedLlm, SequentialIds,
+        FixedClock, InMemoryCalendar, InMemoryConversationRepository, InMemoryDigestRepository,
+        InMemoryReminderRepository, ScriptedLlm, SequentialIds, StubPrices,
     };
 
     use super::*;
@@ -219,6 +275,40 @@ mod tests {
         None
     }
 
+    pub(super) type Prices = serana_services::PriceChat<
+        StubPrices,
+        InMemoryDigestRepository,
+        Arc<ScriptedLlm>,
+        FixedClock,
+        InMemoryConversationRepository,
+    >;
+
+    /// A prices conversation with nothing scripted: these tests are about other subjects,
+    /// and a price turn that reached the model here would panic rather than pass quietly.
+    pub(super) fn prices() -> Prices {
+        prices_answering(Arc::new(ScriptedLlm::new()), StubPrices::new())
+    }
+
+    pub(super) fn prices_answering(llm: Arc<ScriptedLlm>, source: StubPrices) -> Prices {
+        Chat::new(
+            Watching::new(PriceService::new(
+                source,
+                InMemoryDigestRepository::new(),
+                FixedClock::at(NOW),
+                PriceConfig::daily(
+                    vec![
+                        serana_domain::prices::AssetId::new("bitcoin"),
+                        serana_domain::prices::AssetId::new("cow-protocol"),
+                    ],
+                    TimeZoneName::new("Asia/Tbilisi"),
+                ),
+            )),
+            llm,
+            InMemoryConversationRepository::new(),
+            chat_config(),
+        )
+    }
+
     fn extracting(times: usize) -> ScriptedLlm {
         let arguments = serde_json::json!({
             "kind": "monthly", "time": "10:00", "days_of_month": [20], "text": "оформить invoice"
@@ -236,7 +326,15 @@ mod tests {
     #[tokio::test]
     async fn help_explains_the_commands() {
         let service = service(ScriptedLlm::new());
-        let reply = respond(&service, no_calendar(), OWNER, &chat(), &Command::Help).await;
+        let reply = respond(
+            &service,
+            no_calendar(),
+            &prices(),
+            OWNER,
+            &chat(),
+            &Command::Help,
+        )
+        .await;
         assert!(reply.contains("/reminder"), "{reply}");
     }
 
@@ -246,6 +344,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder(
@@ -269,6 +368,7 @@ mod tests {
             let reply = respond(
                 &service,
                 no_calendar(),
+                &prices(),
                 OWNER,
                 &chat(),
                 &Command::Reminder(argument.into()),
@@ -283,7 +383,15 @@ mod tests {
     async fn an_empty_list_invites_the_user_to_create_one() {
         let service = service(ScriptedLlm::new());
         assert_eq!(
-            respond(&service, no_calendar(), OWNER, &chat(), &Command::Reminders).await,
+            respond(
+                &service,
+                no_calendar(),
+                &prices(),
+                OWNER,
+                &chat(),
+                &Command::Reminders
+            )
+            .await,
             text::reminders::NO_REMINDERS
         );
     }
@@ -294,6 +402,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("мне".into()),
@@ -302,13 +411,22 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OTHER,
             &chat(),
             &Command::Reminder("им".into()),
         )
         .await;
 
-        let reply = respond(&service, no_calendar(), OWNER, &chat(), &Command::Reminders).await;
+        let reply = respond(
+            &service,
+            no_calendar(),
+            &prices(),
+            OWNER,
+            &chat(),
+            &Command::Reminders,
+        )
+        .await;
         assert_eq!(reply.matches("🆔 ").count(), 1, "{reply}");
         assert!(reply.contains("🆔 r1"), "{reply}");
     }
@@ -322,6 +440,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("что-то".into()),
@@ -331,6 +450,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("remove it".into()),
@@ -338,7 +458,15 @@ mod tests {
         .await;
         assert!(reply.contains("Deleted"), "{reply}");
         assert_eq!(
-            respond(&service, no_calendar(), OWNER, &chat(), &Command::Reminders).await,
+            respond(
+                &service,
+                no_calendar(),
+                &prices(),
+                OWNER,
+                &chat(),
+                &Command::Reminders
+            )
+            .await,
             text::reminders::NO_REMINDERS
         );
     }
@@ -384,6 +512,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -393,6 +522,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("remove the invoice reminder".into()),
@@ -430,6 +560,7 @@ mod tests {
         let created = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("pay every month, 1st to 6th".into()),
@@ -440,6 +571,7 @@ mod tests {
         let ticked = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("exchanged the money".into()),
@@ -476,6 +608,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("pay monthly".into()),
@@ -485,6 +618,7 @@ mod tests {
         let done = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("did both of them".into()),
@@ -508,6 +642,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -517,6 +652,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("done with it".into()),
@@ -534,6 +670,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -543,6 +680,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("already sent the invoice".into()),
@@ -570,6 +708,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -579,6 +718,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("make it the 20th to the 26th at 22:30".into()),
@@ -603,6 +743,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("remove the invoice reminder".into()),
@@ -620,6 +761,7 @@ mod tests {
         respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("каждый месяц 20".into()),
@@ -629,6 +771,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OTHER,
             &chat(),
             &Command::Reminder("remove it".into()),
@@ -652,6 +795,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("remove something".into()),
@@ -669,6 +813,7 @@ mod tests {
         let reply = respond(
             &service,
             no_calendar(),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Reminder("do something".into()),
@@ -692,7 +837,7 @@ mod calendar_tests {
     };
 
     use super::tests::{
-        Calendar, NOW, OWNER, TRAVEL, chat, chat_config, service, service_with_llm,
+        Calendar, NOW, OWNER, TRAVEL, chat, chat_config, prices, service, service_with_llm,
     };
     use super::*;
 
@@ -734,6 +879,7 @@ mod calendar_tests {
         let reply = respond(
             &service,
             None::<&Calendar>,
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("what's on?".into()),
@@ -752,6 +898,7 @@ mod calendar_tests {
             let reply = respond(
                 &service,
                 Some(&calendar),
+                &prices(),
                 OWNER,
                 &chat(),
                 &Command::Calendar(argument.into()),
@@ -779,6 +926,7 @@ mod calendar_tests {
         let reply = respond(
             &service(ScriptedLlm::new()),
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("стоматолог завтра в 2".into()),
@@ -807,6 +955,7 @@ mod calendar_tests {
         let reply = respond(
             &service(ScriptedLlm::new()),
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("I am not going to the design review".into()),
@@ -823,6 +972,7 @@ mod calendar_tests {
         let reply = respond(
             &service(ScriptedLlm::new()),
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("cancel the dentist".into()),
@@ -850,6 +1000,7 @@ mod calendar_tests {
         let reply = respond(
             &service(ScriptedLlm::new()),
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("delete the design review".into()),
@@ -866,6 +1017,7 @@ mod calendar_tests {
         let reply = respond(
             &service(ScriptedLlm::new()),
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("what's on?".into()),
@@ -882,6 +1034,7 @@ mod calendar_tests {
         let reply = respond(
             &service(ScriptedLlm::new()),
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Compact,
@@ -908,14 +1061,132 @@ mod calendar_tests {
         respond(
             &service,
             Some(&calendar),
+            &prices(),
             OWNER,
             &chat(),
             &Command::Calendar("what's on tomorrow?".into()),
         )
         .await;
-        let reply = respond(&service, Some(&calendar), OWNER, &chat(), &Command::Compact).await;
+        let reply = respond(
+            &service,
+            Some(&calendar),
+            &prices(),
+            OWNER,
+            &chat(),
+            &Command::Compact,
+        )
+        .await;
 
         assert_eq!(reply, text::COMPACTED);
         assert_eq!(llm.remaining(), 0, "the summary call happened");
+    }
+}
+
+#[cfg(test)]
+mod prices_tests {
+    use std::sync::Arc;
+
+    use serana_domain::prices::{AssetId, PriceError};
+    use serana_domain::reminder::TimeZoneName;
+    use serana_services::{Chat, PriceConfig, PriceService, Watching};
+    use serana_testkit::{
+        FixedClock, InMemoryConversationRepository, InMemoryDigestRepository, ScriptedLlm,
+        StubPrices,
+    };
+
+    use super::tests::{NOW, OWNER, chat, chat_config, service};
+    use super::*;
+
+    type Prices = PriceChat<
+        Arc<StubPrices>,
+        InMemoryDigestRepository,
+        Arc<ScriptedLlm>,
+        FixedClock,
+        InMemoryConversationRepository,
+    >;
+
+    /// A prices conversation whose source and model can both be inspected afterwards.
+    fn prices(llm: &Arc<ScriptedLlm>, source: &Arc<StubPrices>) -> Prices {
+        Chat::new(
+            Watching::new(PriceService::new(
+                Arc::clone(source),
+                InMemoryDigestRepository::new(),
+                FixedClock::at(NOW),
+                PriceConfig::daily(
+                    vec![AssetId::new("bitcoin"), AssetId::new("cow-protocol")],
+                    TimeZoneName::new("Asia/Tbilisi"),
+                ),
+            )),
+            Arc::clone(llm),
+            InMemoryConversationRepository::new(),
+            chat_config(),
+        )
+    }
+
+    fn market() -> Arc<StubPrices> {
+        Arc::new(
+            StubPrices::new()
+                .priced("bitcoin", 84_753.0)
+                .priced("cow-protocol", 0.160295),
+        )
+    }
+
+    async fn bare(prices: &Prices, argument: &str) -> String {
+        respond(
+            &service(ScriptedLlm::new()),
+            None::<&super::tests::Calendar>,
+            prices,
+            OWNER,
+            &chat(),
+            &Command::Prices(argument.into()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_bare_prices_command_shows_the_digest_without_asking_anything() {
+        // It is the most common thing anyone sends here, and it means exactly one thing.
+        let llm = Arc::new(ScriptedLlm::new());
+        let prices = prices(&llm, &market());
+        for argument in ["", "   "] {
+            let reply = bare(&prices, argument).await;
+            assert!(reply.contains("$84,753"), "{argument:?}: {reply}");
+            assert!(reply.contains("$0.1603"), "{argument:?}: {reply}");
+        }
+        assert_eq!(llm.call_count(), 0, "no tokens spent on it");
+    }
+
+    #[tokio::test]
+    async fn a_bare_prices_command_starts_the_daily_digest_and_says_when() {
+        let prices = prices(&Arc::new(ScriptedLlm::new()), &market());
+        let reply = bare(&prices, "").await;
+        assert!(reply.contains("every day at 09:00"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn asking_twice_reads_the_market_once() {
+        // The whole bargain of a digest, and it has to hold for the shortcut too.
+        let source = market();
+        let prices = prices(&Arc::new(ScriptedLlm::new()), &source);
+        bare(&prices, "").await;
+        bare(&prices, "").await;
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_market_that_cannot_be_read_with_nothing_cached_says_so() {
+        let source = Arc::new(StubPrices::broken(PriceError::new("429 (rate limited)")));
+        let prices = prices(&Arc::new(ScriptedLlm::new()), &source);
+        assert_eq!(bare(&prices, "").await, text::prices::NO_MARKET);
+    }
+
+    #[tokio::test]
+    async fn anything_said_after_the_command_still_goes_to_the_model() {
+        // The shortcut is for the bare command only: "send it at 8" has to be read.
+        let llm = Arc::new(ScriptedLlm::new().answering("What time of day?"));
+        let prices = prices(&llm, &market());
+        let reply = bare(&prices, "move the digest").await;
+        assert_eq!(reply, "What time of day?");
+        assert_eq!(llm.call_count(), 1);
     }
 }

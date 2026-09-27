@@ -3,7 +3,8 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use serana_domain::reminder::{Notifier, NotifyError, Reminder, UserId};
+use serana_domain::NotifyError;
+use serana_domain::reminder::{Notifier, Reminder, UserId};
 
 /// Captures every delivery, and can be told to fail.
 pub struct RecordingNotifier {

@@ -34,6 +34,7 @@ pub fn parse(line: &str) -> Input {
         "reminder" => Input::Command(Command::Reminder(rest.to_owned())),
         "reminders" => Input::Command(Command::Reminders),
         "calendar" | "cal" => Input::Command(Command::Calendar(rest.to_owned())),
+        "prices" | "price" => Input::Command(Command::Prices(rest.to_owned())),
         "compact" => Input::Command(Command::Compact),
         "quit" | "exit" | "q" => Input::Quit,
         other => Input::Unknown(other.to_owned()),
@@ -61,6 +62,19 @@ mod tests {
             parse("cal"),
             Input::Command(Command::Calendar(String::new())),
             "the short form reaches the same place"
+        );
+    }
+
+    #[test]
+    fn prices_takes_the_rest_of_the_line_verbatim() {
+        assert_eq!(
+            parse("/prices what is btc doing?"),
+            Input::Command(Command::Prices("what is btc doing?".into()))
+        );
+        assert_eq!(
+            parse("price"),
+            Input::Command(Command::Prices(String::new())),
+            "the singular reaches the same place"
         );
     }
 

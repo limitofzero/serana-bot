@@ -25,6 +25,9 @@ pub enum Command {
     /// something on it, calling something off. Like [`Command::Reminder`], the model reads
     /// the intent, so there is no command per verb and no id to type by hand.
     Calendar(String),
+    /// Anything to do with the crypto price digest, in the user's own words: what things
+    /// are worth, when the daily digest should land, or stopping it.
+    Prices(String),
     /// Summarise the conversation so far and carry on from the summary. The history is
     /// what lets a follow-up answer land, so this folds it up rather than discarding it.
     Compact,
@@ -40,6 +43,7 @@ pub enum Topic {
     #[default]
     Reminders,
     Calendar,
+    Prices,
 }
 
 impl Command {
@@ -49,6 +53,7 @@ impl Command {
         match topic {
             Topic::Reminders => Self::Reminder(request),
             Topic::Calendar => Self::Calendar(request),
+            Topic::Prices => Self::Prices(request),
         }
     }
 
@@ -85,6 +90,7 @@ impl Command {
         match self {
             Self::Reminder(_) | Self::Reminders => Some(Topic::Reminders),
             Self::Calendar(_) => Some(Topic::Calendar),
+            Self::Prices(_) => Some(Topic::Prices),
             Self::Help | Self::Compact => None,
         }
     }

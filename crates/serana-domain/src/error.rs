@@ -155,3 +155,18 @@ mod tests {
         assert_eq!(without, "rate limited");
     }
 }
+
+/// A failure delivering something out of band — a reminder that came due, a digest.
+///
+/// Two variants because the scheduler treats them differently: one is retried on the next
+/// tick, the other switches the thing off rather than paying for a delivery that can never
+/// land.
+#[derive(Debug, Error)]
+pub enum NotifyError {
+    /// The user cannot be reached and never will be — blocked the bot, deleted the chat.
+    #[error("recipient unreachable: {0}")]
+    Unreachable(String),
+
+    #[error("delivery failed: {0}")]
+    Transport(String),
+}

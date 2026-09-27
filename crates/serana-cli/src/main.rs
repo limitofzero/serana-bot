@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
                     respond(
                         &wiring.reminders,
                         wiring.calendar.as_ref(),
+                        &wiring.prices,
                         owner,
                         &conversation,
                         &command,

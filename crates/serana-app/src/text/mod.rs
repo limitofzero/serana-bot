@@ -6,6 +6,7 @@
 
 pub mod calendar;
 pub mod format;
+pub mod prices;
 pub mod reminders;
 
 use crate::command::Topic;
@@ -32,6 +33,7 @@ Serana — your reminders and your calendar, in plain words.
 /reminder — set, change, remove or finish one
 /reminders — list them
 /calendar — what is on, book something, call something off
+/prices — crypto prices, and when the daily digest lands
 /compact — fold this conversation up into a summary
 /help — this message
 
@@ -41,7 +43,9 @@ Just say what you want:
   /reminder I already sent the invoice
   /calendar what have I got on Friday?
   /calendar dentist on Friday at 3, Chavchavadze 1
-  /calendar I am not going to Monday\'s standup";
+  /calendar I am not going to Monday\'s standup
+  /prices what is COW doing?
+  /prices send the digest at 8 instead";
 
 pub const COMPACTED: &str =
     "🧹 Folded the conversation up into a summary. I still know where we got to.";

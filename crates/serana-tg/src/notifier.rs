@@ -1,11 +1,13 @@
-//! Delivering reminders over Telegram.
+//! Delivering what the schedulers push, over Telegram.
 
 use async_trait::async_trait;
-use serana_domain::reminder::{Notifier, NotifyError, Reminder, UserId};
+use serana_domain::NotifyError;
+use serana_domain::prices::{DigestNotifier, Snapshot};
+use serana_domain::reminder::{Notifier, Reminder, UserId};
 use teloxide::prelude::*;
 use teloxide::{ApiError, RequestError};
 
-/// Sends a reminder to its owner's private chat.
+/// Sends what a scheduler pushed to its owner's private chat.
 ///
 /// In a private chat Telegram's chat id and user id are the same number, so the owner's
 /// [`UserId`] is enough to reach them without storing a separate chat id.
@@ -35,6 +37,22 @@ impl Notifier for TelegramNotifier {
             .send_message(
                 ChatId(owner.get()),
                 serana_app::text::reminders::fired(reminder, now),
+            )
+            .await
+            .map(|_| ())
+            .map_err(classify)
+    }
+}
+
+#[async_trait]
+impl DigestNotifier for TelegramNotifier {
+    async fn notify(&self, owner: UserId, snapshot: &Snapshot) -> Result<(), NotifyError> {
+        // The digest is read at the moment it is sent, so "how old is this?" is answered
+        // against the same instant it was taken — it reads as "just now", which is true.
+        self.bot
+            .send_message(
+                ChatId(owner.get()),
+                serana_app::text::prices::pushed(snapshot),
             )
             .await
             .map(|_| ())

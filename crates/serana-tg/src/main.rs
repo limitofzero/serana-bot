@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use serana_app::{
-    AppConfig, Calendar, Command, Reminders, Topics, build_reminders, build_scheduler, respond,
-    text,
+    AppConfig, Calendar, Command, Digest, Reminders, Topics, build_digest_scheduler,
+    build_reminders, build_scheduler, respond, text,
 };
 use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::UserId;
@@ -18,6 +18,7 @@ struct AppState {
     reminders: Reminders,
     /// `None` when no calendar is configured, which is a supported way to run.
     calendar: Option<Calendar>,
+    prices: Digest,
     /// What each person was last talking about, so a bare message continues it.
     topics: Topics,
     telegram: TelegramConfig,
@@ -47,8 +48,11 @@ async fn main() -> anyhow::Result<()> {
 
     // One scheduler ticking beside the dispatcher. Both share the database; SQLite in WAL
     // mode lets the tick read while a command writes.
-    let scheduler = build_scheduler(wiring.repository, TelegramNotifier::new(bot.clone()));
     let tick_interval = config.tick_interval;
+    let digests = build_digest_scheduler(&wiring, TelegramNotifier::new(bot.clone()));
+    tokio::spawn(async move { digests.run(tick_interval).await });
+
+    let scheduler = build_scheduler(wiring.repository, TelegramNotifier::new(bot.clone()));
     tokio::spawn(async move { scheduler.run(tick_interval).await });
 
     // Telegram keeps the command menu server-side, per bot token. Without this it keeps
@@ -72,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         reminders: wiring.reminders,
         calendar: wiring.calendar,
+        prices: wiring.prices,
         topics: Topics::new(),
         telegram,
     });
@@ -174,6 +179,7 @@ async fn answer(
         respond(
             &state.reminders,
             state.calendar.as_ref(),
+            &state.prices,
             sender,
             &ConversationId::new(format!("tg:{sender}")),
             &command,

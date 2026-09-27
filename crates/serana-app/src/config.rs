@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use serana_adapters::GoogleCalendarConfig;
+use serana_adapters::{CoinGeckoConfig, GoogleCalendarConfig};
+use serana_domain::prices::AssetId;
 use serana_domain::reminder::TimeZoneName;
 
 /// Where reminders live inside the container. Overridden by `SERANA_DATA_DIR`.
@@ -22,6 +23,9 @@ const DEFAULT_TICK_SECONDS: u64 = 60;
 /// How long to reserve either side of an appointment the person has to travel to. Half an
 /// hour is a city's worth of getting there; `SERANA_TRAVEL_MINUTES` overrides it.
 const DEFAULT_TRAVEL_MINUTES: u64 = 30;
+/// What the price digest quotes when nobody has said otherwise. CoinGecko ids, because
+/// that is what both price sources take.
+const DEFAULT_ASSETS: &str = "bitcoin,ethereum,cow-protocol";
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -41,6 +45,10 @@ pub struct AppConfig {
     pub calendar: Option<GoogleCalendarConfig>,
     /// Reserved either side of an in-person appointment.
     pub travel: Duration,
+    /// What the price digest quotes, in the order it is shown.
+    pub assets: Vec<AssetId>,
+    /// CoinGecko. The keyless route is the default; a demo key only lifts the rate limit.
+    pub coingecko: CoinGeckoConfig,
 }
 
 impl AppConfig {
@@ -92,6 +100,11 @@ impl AppConfig {
             temperature,
             calendar: google_from_env(),
             travel: Duration::from_secs(travel_minutes * 60),
+            assets: parse_assets(&var_or("SERANA_PRICE_ASSETS", DEFAULT_ASSETS)),
+            coingecko: CoinGeckoConfig {
+                api_key: var_or("SERANA_COINGECKO_API_KEY", ""),
+                ..CoinGeckoConfig::default()
+            },
         })
     }
 
@@ -117,6 +130,18 @@ fn google_from_env() -> Option<GoogleCalendarConfig> {
     config.is_configured().then_some(config)
 }
 
+/// A comma-separated watchlist.
+///
+/// Blank entries are dropped rather than refused: `bitcoin,,ethereum` is a trailing comma
+/// somebody left behind, not a request to price the empty string.
+fn parse_assets(raw: &str) -> Vec<AssetId> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(AssetId::new)
+        .collect()
+}
+
 pub fn var_or(key: &str, fallback: &str) -> String {
     match std::env::var(key) {
         Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
@@ -140,6 +165,8 @@ mod tests {
             temperature: None,
             calendar: None,
             travel: Duration::from_secs(30 * 60),
+            assets: parse_assets(DEFAULT_ASSETS),
+            coingecko: CoinGeckoConfig::default(),
         }
     }
 
@@ -192,6 +219,28 @@ mod tests {
         for key in keys {
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[test]
+    fn the_default_watchlist_is_the_three_that_were_asked_for() {
+        assert_eq!(
+            parse_assets(DEFAULT_ASSETS)
+                .iter()
+                .map(|a| a.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["bitcoin", "ethereum", "cow-protocol"]
+        );
+    }
+
+    #[test]
+    fn a_watchlist_survives_the_punctuation_people_leave_behind() {
+        // A trailing comma is not a request to price the empty string.
+        assert_eq!(
+            parse_assets(" bitcoin , ,ethereum,").len(),
+            2,
+            "blank entries are dropped"
+        );
+        assert!(parse_assets("   ").is_empty());
     }
 
     #[test]
