@@ -9,6 +9,7 @@ use serana_app::{
 use serana_domain::conversation::ConversationId;
 use serana_domain::reminder::UserId;
 use serana_tg::TelegramCommand;
+use serana_tg::admission::{Admission, admit};
 use serana_tg::config::TelegramConfig;
 use serana_tg::notifier::TelegramNotifier;
 use teloxide::prelude::*;
@@ -115,6 +116,30 @@ async fn reply(bot: &Bot, message: &Message, body: String) {
     }
 }
 
+/// Decide admission and act on everything except `Admit`: log a refusal, or reply and stop
+/// for a group chat. Returns the sender only when the caller may proceed.
+///
+/// Shared by `dispatch` and `dispatch_text` so the decision, the log line and the
+/// private-chat reply exist in exactly one place each.
+async fn admitted(bot: &Bot, message: &Message, state: &AppState) -> Option<UserId> {
+    match admit(sender(message), message.chat.is_private(), |user| {
+        state.telegram.allows(user)
+    }) {
+        Admission::Ignore => None,
+        Admission::Refused(sender) => {
+            // Logged at warn so an owner who mistyped their own id can see why nothing
+            // works. No reply: an unauthenticated reply path is the vulnerability.
+            tracing::warn!(user = %sender, "refused a command from a user outside the allowlist");
+            None
+        }
+        Admission::PrivateChatOnly => {
+            reply(bot, message, text::PRIVATE_CHAT_ONLY.to_owned()).await;
+            None
+        }
+        Admission::Admit(sender) => Some(sender),
+    }
+}
+
 /// A message that is not a command: treated as a continuation of the conversation.
 async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyhow::Result<()> {
     let Some(text) = message
@@ -126,15 +151,22 @@ async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyh
         // Stickers, photos, joins — nothing to read.
         return Ok(());
     };
+
+    // Admission is decided before anything else runs, exactly as in `dispatch` — a
+    // slash-prefixed word that reached here is still a message from whoever sent it, and a
+    // stranger's guess at a command must not get a reply any more than their plain text
+    // would.
+    let Some(sender) = admitted(&bot, &message, &state).await else {
+        return Ok(());
+    };
+
     // A slash-prefixed word that reached here is a command we do not have; answering it as
     // a reminder request would be worse than saying so.
     if text.starts_with('/') {
         reply(&bot, &message, text::UNKNOWN_COMMAND.to_owned()).await;
         return Ok(());
     }
-    let Some(sender) = sender(&message) else {
-        return Ok(());
-    };
+
     // A bare "yes" answers the last question asked, and the assistant keeps one
     // conversation per subject.
     let last = state.topics.last(sender);
@@ -149,7 +181,7 @@ async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyh
         Some(quoted) => Command::replying(text::topic_of(quoted).unwrap_or(last), quoted, &text),
         None => Command::bare(last, &text),
     };
-    answer(bot, message, command, state).await
+    run(bot, message, sender, command, state).await
 }
 
 async fn dispatch(
@@ -158,38 +190,37 @@ async fn dispatch(
     command: TelegramCommand,
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
-    answer(bot, message, Command::from(command), state).await
+    // Admission is decided once, before the command that teloxide already parsed runs.
+    let Some(sender) = admitted(&bot, &message, &state).await else {
+        return Ok(());
+    };
+    run(bot, message, sender, Command::from(command), state).await
 }
 
-/// Check the sender, run the command, send the reply.
-async fn answer(
+/// Run an already-admitted command and send the reply.
+///
+/// Everything that can affect state or produce a reply happens here, and only here —
+/// `dispatch` and `dispatch_text` both gate on [`admit`] before reaching it, so `sender` is
+/// known to be on the allowlist and `message.chat` is known to be a private chat.
+async fn run(
     bot: Bot,
     message: Message,
+    sender: UserId,
     command: Command,
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
-    let Some(sender) = sender(&message) else {
-        return Ok(());
-    };
-
-    let reply = if state.telegram.allows(sender) {
-        // Noted before the turn, not after: it is where the next bare message goes, and a
-        // turn that fails is still the subject they are on.
-        state.topics.note(sender, &command);
-        respond(
-            &state.reminders,
-            state.calendar.as_ref(),
-            &state.prices,
-            sender,
-            &ConversationId::new(format!("tg:{sender}")),
-            &command,
-        )
-        .await
-    } else {
-        // Logged at warn so an owner who mistyped their own id can see why nothing works.
-        tracing::warn!(user = %sender, "refused a command from a user outside the allowlist");
-        text::NOT_ALLOWED.to_owned()
-    };
+    // Noted before the turn, not after: it is where the next bare message goes, and a turn
+    // that fails is still the subject they are on.
+    state.topics.note(sender, &command);
+    let reply = respond(
+        &state.reminders,
+        state.calendar.as_ref(),
+        &state.prices,
+        sender,
+        &ConversationId::new(format!("tg:{sender}")),
+        &command,
+    )
+    .await;
 
     bot.send_message(message.chat.id, reply).await?;
     Ok(())

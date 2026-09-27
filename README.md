@@ -20,7 +20,9 @@ when it comes round. Downtime collapses missed firings into one message rather t
 them.
 
 The bot answers only the Telegram user ids in `SERANA_ALLOWED_USER_IDS`, and an empty list
-means nobody.
+means nobody. It only takes commands in a private chat with it — an allowed id typing in a
+group the bot is a member of is told to message it privately instead, since your reminders
+and calendar would otherwise be posted where anyone in that group could read them.
 
 ## Run it
 

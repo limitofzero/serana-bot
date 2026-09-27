@@ -55,7 +55,11 @@ pub const NOTHING_TO_COMPACT: &str = "Nothing to fold up yet.";
 pub const UNKNOWN_COMMAND: &str =
     "I do not know that command.\nJust say what you want — /help lists what I can do.";
 
-pub const NOT_ALLOWED: &str = "This is a personal bot and does not answer you.";
+/// Told to an allowed user who tries a command from a group or channel: their reminders,
+/// calendar and conversation are keyed by sender, not by chat, and posting them into a
+/// group the bot happens to be a member of would leak them to everyone else there.
+pub const PRIVATE_CHAT_ONLY: &str =
+    "Message me privately for that — I don't answer commands in groups.";
 
 #[cfg(test)]
 mod tests {

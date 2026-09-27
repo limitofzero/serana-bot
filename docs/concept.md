@@ -42,7 +42,9 @@ roughly this order:
   with `temperature = 0`, not a general agent asked to be careful.
 - **Least privilege.** The bot answers only the ids in `SERANA_ALLOWED_USER_IDS`, and an
   empty list means nobody. A leaked bot token with an open allowlist would take instructions
-  from, and spend tokens for, whoever found it.
+  from, and spend tokens for, whoever found it. That check only admits a command run in a
+  private chat with the bot — reminders and calendar state are keyed by sender, and a group
+  the bot happens to be a member of is not a private channel to that data.
 - **Context efficiency.** Nothing is re-rendered into the system prompt mid-conversation —
   the prompt-caching invariant in `reference-notes.md` §2 is the same argument with a price
   tag attached. Retrieved memories arrive as tool results.
