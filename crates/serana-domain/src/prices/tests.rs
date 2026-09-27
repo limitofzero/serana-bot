@@ -132,3 +132,84 @@ fn a_digest_stored_before_there_was_a_cache_still_loads() {
     let digest: Digest = serde_json::from_str(&json).expect("loads without `cached`");
     assert!(digest.cached.is_none());
 }
+
+#[test]
+fn watching_something_new_adds_it_at_the_end_and_drops_the_cache() {
+    // The cache no longer covers what is watched. Showing it would present a list missing
+    // the very asset just asked for, for a whole day.
+    let mut digest = digest();
+    digest.cached = Some(snapshot("2026-09-28T05:00:00Z"));
+
+    assert!(digest.watch(AssetId::new("1inch")));
+    assert_eq!(digest.assets.last(), Some(&AssetId::new("1inch")));
+    assert!(digest.cached.is_none());
+}
+
+#[test]
+fn watching_something_already_watched_changes_nothing() {
+    let mut digest = digest();
+    digest.cached = Some(snapshot("2026-09-28T05:00:00Z"));
+
+    assert!(!digest.watch(AssetId::new("bitcoin")));
+    assert_eq!(digest.assets.len(), 3, "no duplicate row");
+    assert!(digest.cached.is_some(), "and nothing to invalidate");
+}
+
+#[test]
+fn unwatching_keeps_the_rest_of_the_cache() {
+    // Everything else in it is still true; reading the market again to show one line
+    // fewer would be waste.
+    let mut digest = digest();
+    digest.cached = Some(Snapshot::new(
+        vec![
+            Quote {
+                asset: AssetId::new("bitcoin"),
+                symbol: "BTC".into(),
+                usd: 84_753.0,
+                change_24h: None,
+            },
+            Quote {
+                asset: AssetId::new("cow-protocol"),
+                symbol: "COW".into(),
+                usd: 0.16,
+                change_24h: None,
+            },
+        ],
+        ts("2026-09-28T05:00:00Z"),
+        "coingecko",
+    ));
+
+    assert!(digest.unwatch(&AssetId::new("cow-protocol")));
+    assert!(!digest.assets.contains(&AssetId::new("cow-protocol")));
+    let cached = digest.cached.unwrap();
+    assert_eq!(cached.quotes.len(), 1);
+    assert_eq!(cached.quotes[0].symbol, "BTC");
+}
+
+#[test]
+fn unwatching_something_not_watched_says_so() {
+    assert!(!digest().unwatch(&AssetId::new("1inch")));
+}
+
+#[test]
+fn a_watched_asset_is_found_by_its_ticker_as_well_as_its_id() {
+    // People say "remove COW", not "remove cow-protocol".
+    let mut digest = digest();
+    digest.cached = Some(Snapshot::new(
+        vec![Quote {
+            asset: AssetId::new("cow-protocol"),
+            symbol: "COW".into(),
+            usd: 0.16,
+            change_24h: None,
+        }],
+        ts("2026-09-28T05:00:00Z"),
+        "coingecko",
+    ));
+
+    assert_eq!(digest.find("cow"), Some(&AssetId::new("cow-protocol")));
+    assert_eq!(
+        digest.find("Cow-Protocol"),
+        Some(&AssetId::new("cow-protocol"))
+    );
+    assert_eq!(digest.find("1inch"), None);
+}

@@ -111,6 +111,33 @@ where
             }
             tools::PAUSE => Ok(PriceOutcome::Paused(self.prices.pause(owner).await?)),
             tools::RESUME => Ok(PriceOutcome::Rescheduled(self.prices.resume(owner).await?)),
+            tools::ADD => {
+                let args: tools::AddArgs = serde_json::from_value(arguments).map_err(incomplete)?;
+                let edit = self.prices.add(owner, &args.names).await?;
+                let snapshot = if edit.added.is_empty() {
+                    edit.digest.cached.clone()
+                } else {
+                    // The cache was dropped when the list grew, so this reads the market —
+                    // and the reply shows the new asset priced, which is what was asked.
+                    // A failed read still leaves it added; the prices come next time.
+                    match self.prices.show(owner, false).await {
+                        Ok((_, snapshot, _)) => Some(snapshot),
+                        Err(PriceTurnError::Market(error)) => {
+                            tracing::warn!(%error, "added assets, but could not price them");
+                            None
+                        }
+                        Err(other) => return Err(other),
+                    }
+                };
+                Ok(PriceOutcome::Edited { edit, snapshot })
+            }
+            tools::REMOVE => {
+                let args: tools::RemoveArgs =
+                    serde_json::from_value(arguments).map_err(incomplete)?;
+                let edit = self.prices.remove(owner, &args.names).await?;
+                let snapshot = edit.digest.cached.clone();
+                Ok(PriceOutcome::Edited { edit, snapshot })
+            }
             // `knows` gates the caller, so reaching here means the two lists disagree.
             other => Err(PriceTurnError::Unparsable(format!(
                 "I do not know how to {other}"

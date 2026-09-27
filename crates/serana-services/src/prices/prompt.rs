@@ -17,8 +17,24 @@ fn standing(digest: Option<&Digest>, now: jiff::Timestamp) -> String {
     let Some(digest) = digest else {
         return "not set up yet".to_owned();
     };
+    // Each asset with the ticker it was last shown under, so "remove COW" can be matched to
+    // `cow-protocol` without the model having to know CoinGecko's ids.
+    let watching: Vec<serde_json::Value> = digest
+        .assets
+        .iter()
+        .map(|asset| {
+            let symbol = digest.cached.as_ref().and_then(|snapshot| {
+                snapshot
+                    .quotes
+                    .iter()
+                    .find(|quote| &quote.asset == asset)
+                    .map(|quote| quote.symbol.clone())
+            });
+            serde_json::json!({ "id": asset.as_str(), "ticker": symbol })
+        })
+        .collect();
     serde_json::json!({
-        "watching": digest.assets.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        "watching": watching,
         "schedule": digest.recurrence,
         "zone": digest.timezone.to_string(),
         "arriving": digest.is_active(),
@@ -49,6 +65,8 @@ pub(crate) const INSTRUCTIONS: &str = "You look after a person's crypto price di
      - they say when they want it to arrive -> set_schedule\n\
      - they want it to stop arriving -> pause_digest\n\
      - they want it back -> resume_digest\n\
+     - they want another asset in it -> add_assets\n\
+     - they want one gone from it -> remove_assets\n\
      \n\
      The prices are read once a day and stored, so showing them costs nothing. Call \
      show_prices with fresh=false for an ordinary question; that is almost always right. \
@@ -59,6 +77,11 @@ pub(crate) const INSTRUCTIONS: &str = "You look after a person's crypto price di
      Changing the schedule means giving the whole one, not the part that changed: \"at 8\" \
      on a daily digest is a daily schedule at 08:00. \"At 8\" means 8 where they are, so \
      leave the zone alone unless they name a different place.\n\
+     \n\
+     To add an asset, pass the name exactly as they said it — \"1inch\", \"Uniswap\", \
+     \"ARB\" — and never an id you worked out yourself. The lookup finds the right asset \
+     and the reply names what it found, so they can correct it. Put every name from one \
+     message into one call: \"add uni and aave\" is one add_assets with two names.\n\
      \n\
      If something you need is missing — almost always the time of day — ask for just that \
      one thing rather than calling a function with a value you invented.\n\

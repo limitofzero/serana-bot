@@ -1099,7 +1099,7 @@ mod prices_tests {
 
     type Prices = PriceChat<
         Arc<StubPrices>,
-        InMemoryDigestRepository,
+        Arc<InMemoryDigestRepository>,
         Arc<ScriptedLlm>,
         FixedClock,
         InMemoryConversationRepository,
@@ -1107,10 +1107,19 @@ mod prices_tests {
 
     /// A prices conversation whose source and model can both be inspected afterwards.
     fn prices(llm: &Arc<ScriptedLlm>, source: &Arc<StubPrices>) -> Prices {
+        prices_over(llm, source, &Arc::new(InMemoryDigestRepository::new()))
+    }
+
+    /// The same, over a store another turn already wrote to.
+    fn prices_over(
+        llm: &Arc<ScriptedLlm>,
+        source: &Arc<StubPrices>,
+        store: &Arc<InMemoryDigestRepository>,
+    ) -> Prices {
         Chat::new(
             Watching::new(PriceService::new(
                 Arc::clone(source),
-                InMemoryDigestRepository::new(),
+                Arc::clone(store),
                 FixedClock::at(NOW),
                 PriceConfig::daily(
                     vec![AssetId::new("bitcoin"), AssetId::new("cow-protocol")],
@@ -1188,5 +1197,54 @@ mod prices_tests {
         let reply = bare(&prices, "move the digest").await;
         assert_eq!(reply, "What time of day?");
         assert_eq!(llm.call_count(), 1);
+    }
+
+    /// A market where "1inch" finds the token and its lookalikes.
+    fn searchable() -> Arc<StubPrices> {
+        Arc::new(
+            StubPrices::new()
+                .listed("bitcoin", "Bitcoin", "BTC", Some(1), 84_753.0)
+                .listed("cow-protocol", "CoW Protocol", "COW", Some(312), 0.160295)
+                .listed("1inch-yvault", "1INCH yVault", "YV1INCH", None, 0.2)
+                .listed("1inch", "1INCH", "1INCH", Some(233), 0.2345),
+        )
+    }
+
+    fn calling(tool: &str, names: &[&str]) -> Arc<ScriptedLlm> {
+        Arc::new(
+            ScriptedLlm::new().calling(vec![serana_domain::message::ToolCall::new(
+                "c1",
+                tool,
+                serde_json::json!({ "names": names }).to_string(),
+            )]),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_asked_for_phrasing_adds_the_token_and_shows_it_priced() {
+        // "/prices add 1inch token price" — the model passes the words, the lookup finds the
+        // token rather than its vault, and the reply shows it with a price.
+        let prices = prices(&calling("add_assets", &["1inch token"]), &searchable());
+        let reply = bare(&prices, "add 1inch token price").await;
+
+        assert!(reply.contains("Added 1INCH"), "{reply}");
+        assert!(reply.contains("• 1INCH — $0.2345"), "{reply}");
+        assert!(reply.contains("• BTC"), "the rest is still there: {reply}");
+    }
+
+    #[tokio::test]
+    async fn the_asked_for_phrasing_removes_the_token() {
+        let source = searchable();
+        let store = Arc::new(InMemoryDigestRepository::new());
+        let add = prices_over(&calling("add_assets", &["1inch"]), &source, &store);
+        bare(&add, "add 1inch").await;
+
+        // Same store, next turn.
+        let remove = prices_over(&calling("remove_assets", &["1inch token"]), &source, &store);
+        let reply = bare(&remove, "remove 1inch token price").await;
+
+        assert!(reply.contains("Removed 1INCH"), "{reply}");
+        assert!(!reply.contains("• 1INCH"), "{reply}");
+        assert!(reply.contains("• BTC"), "{reply}");
     }
 }

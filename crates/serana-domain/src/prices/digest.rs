@@ -75,6 +75,51 @@ impl Digest {
         self.reschedule(now)
     }
 
+    /// Add an asset to the end of the watchlist. Returns whether it was new.
+    ///
+    /// What is cached is dropped, because it no longer covers what is watched: showing it
+    /// would present a list missing the very asset just asked for, and a day would pass
+    /// before the next scheduled run noticed.
+    pub fn watch(&mut self, asset: AssetId) -> bool {
+        if self.assets.contains(&asset) {
+            return false;
+        }
+        self.assets.push(asset);
+        self.cached = None;
+        true
+    }
+
+    /// Take an asset off the watchlist. Returns whether it was there.
+    ///
+    /// What is cached is kept, less that asset's row: everything else in it is still true,
+    /// and reading the market again to show one line fewer would be waste.
+    pub fn unwatch(&mut self, asset: &AssetId) -> bool {
+        let before = self.assets.len();
+        self.assets.retain(|watched| watched != asset);
+        if let Some(cached) = &mut self.cached {
+            cached.quotes.retain(|quote| &quote.asset != asset);
+        }
+        self.assets.len() != before
+    }
+
+    /// The watched asset someone meant by `name` — its id, or the ticker it was last shown
+    /// under. Case does not matter; nobody types "COW" and "cow" as different things.
+    pub fn find(&self, name: &str) -> Option<&AssetId> {
+        let wanted = name.trim().to_lowercase();
+        self.assets
+            .iter()
+            .find(|asset| asset.as_str().to_lowercase() == wanted)
+            .or_else(|| {
+                let quote = self
+                    .cached
+                    .as_ref()?
+                    .quotes
+                    .iter()
+                    .find(|quote| quote.symbol.trim().to_lowercase() == wanted)?;
+                self.assets.iter().find(|asset| **asset == quote.asset)
+            })
+    }
+
     /// Whether the digest will go out again.
     pub fn is_active(&self) -> bool {
         self.next_fire_at.is_some()

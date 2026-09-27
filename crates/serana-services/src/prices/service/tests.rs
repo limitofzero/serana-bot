@@ -289,3 +289,155 @@ async fn one_person_s_digest_is_not_another_s() {
         "the default, not the other person's"
     );
 }
+
+/// A market where search has something to find, lookalikes included.
+fn searchable() -> StubPrices {
+    source()
+        .listed("1inch-yvault", "1INCH yVault", "YV1INCH", None, 0.2)
+        .listed("1inch", "1INCH", "1INCH", Some(233), 0.23)
+        .listed("uniswap", "Uniswap", "UNI", Some(30), 7.1)
+        .listed("cow-protocol", "CoW Protocol", "COW", Some(312), 0.160295)
+}
+
+fn names(raw: &[&str]) -> Vec<String> {
+    raw.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[tokio::test]
+async fn adding_by_name_watches_what_the_lookup_resolved_to() {
+    // The model passes "1inch token" as it was said; the id comes from the source.
+    let service = service(searchable());
+    let edit = service.add(OWNER, &names(&["1inch token"])).await.unwrap();
+
+    assert_eq!(edit.added.len(), 1);
+    assert_eq!(edit.added[0].id, AssetId::new("1inch"), "not the vault");
+    assert_eq!(edit.digest.assets.last(), Some(&AssetId::new("1inch")));
+
+    let stored = service.digest(OWNER).await.unwrap();
+    assert!(
+        stored.assets.contains(&AssetId::new("1inch")),
+        "and it stuck"
+    );
+}
+
+#[tokio::test]
+async fn several_can_be_added_at_once() {
+    let service = service(searchable());
+    let edit = service
+        .add(OWNER, &names(&["1inch", "uniswap"]))
+        .await
+        .unwrap();
+    assert_eq!(edit.added.len(), 2);
+    assert_eq!(
+        edit.digest.assets,
+        vec![
+            AssetId::new("bitcoin"),
+            AssetId::new("cow-protocol"),
+            AssetId::new("1inch"),
+            AssetId::new("uniswap"),
+        ],
+        "at the end, in the order asked"
+    );
+}
+
+#[tokio::test]
+async fn adding_something_already_watched_says_so_rather_than_duplicating_it() {
+    let service = service(searchable());
+    let edit = service.add(OWNER, &names(&["cow"])).await.unwrap();
+    assert!(edit.added.is_empty());
+    assert_eq!(edit.already[0].id, AssetId::new("cow-protocol"));
+    assert_eq!(edit.digest.assets.len(), 2, "no duplicate row");
+}
+
+#[tokio::test]
+async fn a_name_that_finds_nothing_is_reported_alongside_the_ones_that_did() {
+    // Every name asked about is accounted for, so a dropped one cannot pass unnoticed.
+    let service = service(searchable());
+    let edit = service
+        .add(OWNER, &names(&["uni", "notarealcoin"]))
+        .await
+        .unwrap();
+    assert_eq!(edit.added[0].id, AssetId::new("uniswap"));
+    assert_eq!(edit.missing, vec!["notarealcoin".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_search_that_fails_changes_nothing() {
+    // Looked up before anything is written, so a rate limit on one name cannot leave the
+    // list half-edited.
+    let service = service(StubPrices::broken(PriceError::new("429 (rate limited)")));
+    assert!(matches!(
+        service.add(OWNER, &names(&["1inch"])).await,
+        Err(PriceTurnError::Market(_))
+    ));
+    let digest = service.digest(OWNER).await.unwrap();
+    assert_eq!(digest.assets.len(), 2);
+}
+
+#[tokio::test]
+async fn adding_invalidates_the_cache_so_the_new_asset_is_shown_next_time() {
+    // Otherwise the list would be missing the very asset just asked for until tomorrow.
+    let service = service(searchable());
+    service.show(OWNER, false).await.unwrap();
+    service.add(OWNER, &names(&["1inch"])).await.unwrap();
+
+    let (_, snapshot, read_now) = service.show(OWNER, false).await.unwrap();
+    assert!(read_now);
+    assert!(
+        snapshot
+            .quotes
+            .iter()
+            .any(|q| q.asset == AssetId::new("1inch")),
+        "{snapshot:?}"
+    );
+}
+
+#[tokio::test]
+async fn removing_by_ticker_takes_it_off_and_keeps_the_rest_of_the_cache() {
+    let service = service(searchable());
+    service.show(OWNER, false).await.unwrap();
+    let edit = service.remove(OWNER, &names(&["COW"])).await.unwrap();
+
+    assert_eq!(
+        edit.removed,
+        vec!["COW".to_owned()],
+        "by the ticker it was shown under"
+    );
+    assert_eq!(edit.digest.assets, vec![AssetId::new("bitcoin")]);
+    let cached = edit.digest.cached.unwrap();
+    assert_eq!(cached.quotes.len(), 1, "the rest is still true");
+
+    let (_, _, read_now) = service.show(OWNER, false).await.unwrap();
+    assert!(!read_now, "and nothing needed reading again");
+}
+
+#[tokio::test]
+async fn removing_something_not_watched_is_reported_rather_than_ignored() {
+    let service = service(searchable());
+    let edit = service
+        .remove(OWNER, &names(&["1inch token"]))
+        .await
+        .unwrap();
+    assert!(edit.removed.is_empty());
+    assert_eq!(edit.missing, vec!["1inch".to_owned()]);
+}
+
+#[tokio::test]
+async fn removing_the_last_asset_is_refused_in_favour_of_pausing() {
+    // A digest of nothing would be retried every tick forever. Someone who wants none of
+    // it wants it switched off.
+    let service = service(searchable());
+    let error = service
+        .remove(OWNER, &names(&["bitcoin", "cow-protocol"]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("stop sending it"), "{error}");
+    let digest = service.digest(OWNER).await.unwrap();
+    assert_eq!(digest.assets.len(), 2, "nothing was removed");
+}
+
+#[tokio::test]
+async fn a_request_naming_nothing_is_refused() {
+    let service = service(searchable());
+    assert!(service.add(OWNER, &names(&["token", "  "])).await.is_err());
+}

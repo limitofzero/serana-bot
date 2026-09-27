@@ -3,9 +3,9 @@
 //! Tickers come from a public market API and are echoed exactly as they came. Nothing here
 //! reads them as anything but text, and nothing here produces a number the source did not.
 
-use serana_domain::prices::{Digest, Quote, Snapshot};
+use serana_domain::prices::{AssetMatch, Digest, Quote, Snapshot};
 use serana_domain::reminder::TimeZoneName;
-use serana_services::PriceOutcome;
+use serana_services::{PriceOutcome, WatchlistEdit};
 
 use super::format::day_and_month;
 use super::reminders::describe;
@@ -154,6 +154,58 @@ pub fn paused(_digest: &Digest) -> String {
         .to_owned()
 }
 
+/// An asset as the lookup resolved it: the ticker, and the name when it says something the
+/// ticker does not. "UNI (Uniswap)" lets the person check it found the right one; "1INCH
+/// (1INCH)" would be noise.
+fn resolved(asset: &AssetMatch) -> String {
+    if asset.name.trim().eq_ignore_ascii_case(asset.symbol.trim()) {
+        asset.symbol.clone()
+    } else {
+        format!("{} ({})", asset.symbol, asset.name)
+    }
+}
+
+/// Confirmation after changing the watchlist.
+///
+/// Every name asked about is accounted for on its own line, then the digest as it now
+/// stands — the question in their mind is "what am I watching now?", not "did it work".
+pub fn edited(edit: &WatchlistEdit, snapshot: Option<&Snapshot>, now: jiff::Timestamp) -> String {
+    let mut lines = Vec::new();
+    if !edit.added.is_empty() {
+        let names: Vec<String> = edit.added.iter().map(resolved).collect();
+        lines.push(format!("✅ Added {}", names.join(", ")));
+    }
+    if !edit.removed.is_empty() {
+        lines.push(format!("🗑 Removed {}", edit.removed.join(", ")));
+    }
+    if !edit.already.is_empty() {
+        let names: Vec<String> = edit.already.iter().map(|a| a.symbol.clone()).collect();
+        lines.push(format!("Already watching {}", names.join(", ")));
+    }
+    if !edit.missing.is_empty() {
+        lines.push(format!(
+            "❓ Could not find {} — try its ticker",
+            edit.missing.join(", ")
+        ));
+    }
+
+    let changed = !edit.added.is_empty() || !edit.removed.is_empty();
+    match snapshot.filter(|snapshot| !snapshot.is_empty()) {
+        Some(snapshot) if changed => lines.push(format!(
+            "\n{}\n\n{}",
+            digest(snapshot, now, &edit.digest.timezone),
+            next_digest(&edit.digest)
+        )),
+        None if !edit.added.is_empty() => lines.push(
+            "Prices for it will show on your next /prices — the market could not be reached \
+             just now."
+                .to_owned(),
+        ),
+        _ => {}
+    }
+    lines.join("\n")
+}
+
 /// What to say about a finished price turn.
 pub fn outcome(outcome: &PriceOutcome, now: jiff::Timestamp) -> String {
     match outcome {
@@ -162,6 +214,7 @@ pub fn outcome(outcome: &PriceOutcome, now: jiff::Timestamp) -> String {
         } => shown(digest, snapshot, now),
         PriceOutcome::Rescheduled(digest) => rescheduled(digest),
         PriceOutcome::Paused(digest) => paused(digest),
+        PriceOutcome::Edited { edit, snapshot } => edited(edit, snapshot.as_ref(), now),
         PriceOutcome::Said(words) => words.clone(),
     }
 }

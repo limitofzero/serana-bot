@@ -8,9 +8,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serana_domain::prices::{AssetId, PriceError, PriceSource, Quote};
+use serana_domain::prices::{AssetId, AssetMatch, PriceError, PriceSource, Quote};
 
-use super::wire::{MarketRow, symbol_for};
+use super::wire::{MarketRow, SearchResults, symbol_for};
 
 const API: &str = "https://api.coingecko.com/api/v3";
 
@@ -47,6 +47,44 @@ impl CoinGecko {
             .map_err(|e| PriceError::new(e.to_string()))?;
         Ok(Self { http, config })
     }
+
+    /// A GET against the API, with the demo key when there is one, returning the body.
+    async fn get(&self, route: &str, query: &[(&str, &str)]) -> Result<String, PriceError> {
+        let mut request = self
+            .http
+            .get(format!(
+                "{}/{route}",
+                self.config.api_base.trim_end_matches('/')
+            ))
+            .query(query);
+        if !self.config.api_key.is_empty() {
+            request = request.header("x-cg-demo-api-key", &self.config.api_key);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| PriceError::new(e.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| PriceError::new(e.to_string()))?;
+        if !status.is_success() {
+            // 429 is the one worth naming: it is what the keyless route does under load,
+            // and it is the reason a fallback exists at all.
+            return Err(PriceError::new(if status.as_u16() == 429 {
+                "429 (rate limited)".to_owned()
+            } else {
+                format!(
+                    "{}: {}",
+                    status.as_u16(),
+                    body.chars().take(160).collect::<String>()
+                )
+            }));
+        }
+        Ok(body)
+    }
 }
 
 #[async_trait]
@@ -65,43 +103,16 @@ impl PriceSource for CoinGecko {
             .collect::<Vec<_>>()
             .join(",");
 
-        let mut request = self
-            .http
-            .get(format!(
-                "{}/coins/markets",
-                self.config.api_base.trim_end_matches('/')
-            ))
-            .query(&[
-                ("vs_currency", "usd"),
-                ("ids", ids.as_str()),
-                ("price_change_percentage", "24h"),
-            ]);
-        if !self.config.api_key.is_empty() {
-            request = request.header("x-cg-demo-api-key", &self.config.api_key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| PriceError::new(e.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| PriceError::new(e.to_string()))?;
-        if !status.is_success() {
-            // 429 is the one worth naming: it is what the keyless route does under load,
-            // and it is the reason a fallback exists at all.
-            return Err(PriceError::new(format!(
-                "{}{}",
-                status.as_u16(),
-                if status.as_u16() == 429 {
-                    " (rate limited)".to_owned()
-                } else {
-                    format!(": {}", body.chars().take(160).collect::<String>())
-                }
-            )));
-        }
+        let body = self
+            .get(
+                "coins/markets",
+                &[
+                    ("vs_currency", "usd"),
+                    ("ids", ids.as_str()),
+                    ("price_change_percentage", "24h"),
+                ],
+            )
+            .await?;
 
         let rows: Vec<MarketRow> = serde_json::from_str(&body)
             .map_err(|e| PriceError::new(format!("unreadable prices: {e}")))?;
@@ -123,6 +134,25 @@ impl PriceSource for CoinGecko {
                     usd: row.current_price?,
                     change_24h: row.price_change_percentage_24h,
                 })
+            })
+            .collect())
+    }
+
+    async fn search(&self, query: &str) -> Result<Vec<AssetMatch>, PriceError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = self.get("search", &[("query", query.trim())]).await?;
+        let results: SearchResults = serde_json::from_str(&body)
+            .map_err(|e| PriceError::new(format!("unreadable search results: {e}")))?;
+        Ok(results
+            .coins
+            .into_iter()
+            .map(|coin| AssetMatch {
+                id: AssetId::new(coin.id),
+                name: coin.name,
+                symbol: coin.symbol.trim().to_owned(),
+                rank: coin.market_cap_rank,
             })
             .collect())
     }

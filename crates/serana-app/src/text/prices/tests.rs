@@ -1,4 +1,4 @@
-use serana_domain::prices::AssetId;
+use serana_domain::prices::{AssetId, AssetMatch};
 use serana_domain::reminder::{Recurrence, UserId};
 
 use super::*;
@@ -213,4 +213,101 @@ fn prose_from_the_model_is_shown_verbatim() {
         ),
         "What time of day?"
     );
+}
+
+fn found(id: &str, name: &str, symbol: &str) -> AssetMatch {
+    AssetMatch {
+        id: AssetId::new(id),
+        name: name.into(),
+        symbol: symbol.into(),
+        rank: Some(1),
+    }
+}
+
+fn edit() -> WatchlistEdit {
+    WatchlistEdit {
+        digest: standing(),
+        added: Vec::new(),
+        already: Vec::new(),
+        removed: Vec::new(),
+        missing: Vec::new(),
+    }
+}
+
+#[test]
+fn an_addition_names_what_the_lookup_found_so_it_can_be_checked() {
+    let mut change = edit();
+    change.added = vec![found("uniswap", "Uniswap", "UNI")];
+    let reply = edited(
+        &change,
+        Some(&market("2026-09-28T05:00:00Z")),
+        ts("2026-09-28T05:00:00Z"),
+    );
+    assert!(reply.contains("Added UNI (Uniswap)"), "{reply}");
+}
+
+#[test]
+fn a_name_that_only_repeats_the_ticker_is_not_shown_twice() {
+    let mut change = edit();
+    change.added = vec![found("1inch", "1INCH", "1INCH")];
+    let reply = edited(
+        &change,
+        Some(&market("2026-09-28T05:00:00Z")),
+        ts("2026-09-28T05:00:00Z"),
+    );
+    assert!(reply.contains("Added 1INCH"), "{reply}");
+    assert!(!reply.contains("1INCH (1INCH)"), "{reply}");
+}
+
+#[test]
+fn a_change_is_followed_by_the_digest_as_it_now_stands() {
+    // "What am I watching now?" is the question, not "did it work".
+    let mut change = edit();
+    change.removed = vec!["ETH".into()];
+    let reply = edited(
+        &change,
+        Some(&market("2026-09-28T05:00:00Z")),
+        ts("2026-09-28T05:00:00Z"),
+    );
+    assert!(reply.contains("Removed ETH"), "{reply}");
+    assert!(reply.contains("💰 Prices"), "{reply}");
+    assert!(reply.contains("Next:"), "{reply}");
+}
+
+#[test]
+fn every_name_asked_about_is_accounted_for() {
+    let mut change = edit();
+    change.added = vec![found("uniswap", "Uniswap", "UNI")];
+    change.already = vec![found("cow-protocol", "CoW Protocol", "COW")];
+    change.missing = vec!["notarealcoin".into()];
+    let reply = edited(
+        &change,
+        Some(&market("2026-09-28T05:00:00Z")),
+        ts("2026-09-28T05:00:00Z"),
+    );
+    assert!(reply.contains("UNI"), "{reply}");
+    assert!(reply.contains("Already watching COW"), "{reply}");
+    assert!(reply.contains("Could not find notarealcoin"), "{reply}");
+}
+
+#[test]
+fn nothing_changing_shows_no_digest() {
+    // Only "could not find" to say; a full price list under it would bury that.
+    let mut change = edit();
+    change.missing = vec!["notarealcoin".into()];
+    let reply = edited(
+        &change,
+        Some(&market("2026-09-28T05:00:00Z")),
+        ts("2026-09-28T05:00:00Z"),
+    );
+    assert!(!reply.contains("💰"), "{reply}");
+}
+
+#[test]
+fn an_addition_the_market_could_not_price_yet_still_confirms_it() {
+    let mut change = edit();
+    change.added = vec![found("uniswap", "Uniswap", "UNI")];
+    let reply = edited(&change, None, ts("2026-09-28T05:00:00Z"));
+    assert!(reply.contains("Added UNI"), "{reply}");
+    assert!(reply.contains("next /prices"), "{reply}");
 }

@@ -1,6 +1,25 @@
 //! What a price turn did, and how the model is told about it.
 
-use serana_domain::prices::{Digest, Snapshot};
+use serana_domain::prices::{AssetMatch, Digest, Snapshot};
+
+/// What a change to the watchlist did, name by name.
+///
+/// Every name asked about lands in exactly one list, so the reply can account for all of
+/// them. A model paraphrasing "add uni, aave and foobar" can drop one, and the person needs
+/// to see which ones landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchlistEdit {
+    pub digest: Digest,
+    /// Newly watched, as the lookup resolved them — so the reply can say *which* asset
+    /// "cow" turned out to be.
+    pub added: Vec<AssetMatch>,
+    /// Asked for, but already there.
+    pub already: Vec<AssetMatch>,
+    /// Taken off, by the label it was shown under.
+    pub removed: Vec<String>,
+    /// Names that matched nothing — nothing found to add, or nothing watched to remove.
+    pub missing: Vec<String>,
+}
 
 /// What one price turn did, so the frontend can say so without re-deriving it.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +36,12 @@ pub enum PriceOutcome {
     Rescheduled(Digest),
     /// The daily digest is switched off. Asking still works; nothing arrives unprompted.
     Paused(Digest),
+    /// The watchlist changed. `snapshot` is the digest as it now stands, when there is one
+    /// to show — read fresh after an addition, or what was cached less the removed rows.
+    Edited {
+        edit: WatchlistEdit,
+        snapshot: Option<Snapshot>,
+    },
     /// The model answered in prose instead of acting — a question back, most often about
     /// what time of day was meant. Shown verbatim.
     Said(String),
@@ -45,6 +70,15 @@ pub(crate) fn summarise(outcome: &PriceOutcome) -> String {
         })
         .to_string(),
         PriceOutcome::Paused(_) => serde_json::json!({ "ok": "paused" }).to_string(),
+        PriceOutcome::Edited { edit, .. } => serde_json::json!({
+            "ok": "edited",
+            "added": edit.added.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            "already_watching": edit.already.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            "removed": edit.removed,
+            "not_found": edit.missing,
+            "now_watching": edit.digest.assets.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        })
+        .to_string(),
         PriceOutcome::Said(words) => words.clone(),
     }
 }

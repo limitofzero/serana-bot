@@ -321,3 +321,86 @@ async fn every_source_failing_reports_all_of_them() {
     assert!(error.to_string().contains("first"), "{error}");
     assert!(error.to_string().contains("second"), "{error}");
 }
+
+#[tokio::test]
+async fn searching_asks_coingecko_by_name_and_keeps_only_coins() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .and(query_param("query", "1inch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "coins": [
+                { "id": "1inch", "name": "1INCH", "symbol": "1INCH", "market_cap_rank": 233 },
+                { "id": "1inch-yvault", "name": "1INCH yVault", "symbol": "YV1INCH",
+                  "market_cap_rank": null },
+            ],
+            "exchanges": [{ "id": "1inch-exchange", "name": "1inch" }],
+            "categories": [],
+        })))
+        .mount(&server)
+        .await;
+
+    let found = coingecko(&server, "").await.search("1inch").await.unwrap();
+    assert_eq!(found.len(), 2, "exchanges are not assets");
+    assert_eq!(found[0].id, AssetId::new("1inch"));
+    assert_eq!(found[0].rank, Some(233));
+    assert_eq!(found[1].rank, None);
+}
+
+#[tokio::test]
+async fn a_ticker_padded_with_a_non_breaking_space_is_trimmed() {
+    // CoinGecko really does send "\u{a0}1COW".
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "coins": [{ "id": "onecow", "name": "OneCOW", "symbol": "\u{a0}1COW",
+                        "market_cap_rank": 3275 }],
+        })))
+        .mount(&server)
+        .await;
+
+    let found = coingecko(&server, "").await.search("1cow").await.unwrap();
+    assert_eq!(found[0].symbol, "1COW");
+}
+
+#[tokio::test]
+async fn an_empty_search_asks_nothing() {
+    let server = MockServer::start().await;
+    assert!(
+        coingecko(&server, "")
+            .await
+            .search("  ")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn defillama_cannot_search_and_says_so() {
+    let server = MockServer::start().await;
+    assert!(defillama(&server).await.search("1inch").await.is_err());
+}
+
+#[tokio::test]
+async fn the_chain_searches_with_the_first_source_that_can() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "coins": [{ "id": "1inch", "name": "1INCH", "symbol": "1INCH",
+                        "market_cap_rank": 233 }],
+        })))
+        .mount(&server)
+        .await;
+
+    // DefiLlama first on purpose: it cannot search, so the chain has to move past it.
+    let chain = Chain::new(vec![
+        Box::new(defillama(&server).await),
+        Box::new(coingecko(&server, "").await),
+    ]);
+    let found = chain.search("1inch").await.unwrap();
+    assert_eq!(found[0].id, AssetId::new("1inch"));
+}

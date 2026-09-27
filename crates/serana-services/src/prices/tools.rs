@@ -14,6 +14,8 @@ pub(crate) const SHOW: &str = "show_prices";
 pub(crate) const SCHEDULE: &str = "set_schedule";
 pub(crate) const PAUSE: &str = "pause_digest";
 pub(crate) const RESUME: &str = "resume_digest";
+pub(crate) const ADD: &str = "add_assets";
+pub(crate) const REMOVE: &str = "remove_assets";
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct ShowArgs {
@@ -36,6 +38,20 @@ pub(crate) struct ScheduleArgs {
     /// always right, because "at 8" means 8 where they are.
     #[serde(default)]
     pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct AddArgs {
+    /// Each asset to add, by the name or ticker they used: "1inch", "Uniswap", "ARB".
+    /// Just the name — not "token", "coin" or "price" — and never an API id you worked out
+    /// yourself: the lookup finds the right one, and the reply says which it found.
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct RemoveArgs {
+    /// Each asset to stop watching, by its ticker or its id as the context line shows it.
+    pub names: Vec<String>,
 }
 
 /// Neither switching off nor back on needs an argument. An empty object is what the schema
@@ -67,12 +83,22 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
             RESUME,
             "Start the digest arriving again, on the schedule it already has.",
         ),
+        ToolSpec::typed::<AddArgs>(
+            ADD,
+            "Add assets to the watchlist. Use this for \"add 1inch\", \"also watch UNI \
+             and AAVE\", \"track Arbitrum too\". Pass every name they gave in one call.",
+        ),
+        ToolSpec::typed::<RemoveArgs>(
+            REMOVE,
+            "Take assets off the watchlist. Use this for \"remove 1inch\", \"stop \
+             tracking ETH\", \"drop COW\". Pass every name they gave in one call.",
+        ),
     ]
 }
 
 /// Whether `name` is one of ours, so a hallucinated tool name is not dispatched.
 pub(crate) fn is_known(name: &str) -> bool {
-    matches!(name, SHOW | SCHEDULE | PAUSE | RESUME)
+    matches!(name, SHOW | SCHEDULE | PAUSE | RESUME | ADD | REMOVE)
 }
 
 #[cfg(test)]
@@ -82,7 +108,7 @@ mod tests {
     #[test]
     fn every_tool_is_offered_and_recognised() {
         let specs = specs();
-        assert_eq!(specs.len(), 4);
+        assert_eq!(specs.len(), 6);
         for spec in &specs {
             assert!(
                 is_known(&spec.name),
@@ -120,6 +146,17 @@ mod tests {
         let properties = spec.parameters["properties"].as_object().unwrap();
         assert_eq!(properties.len(), 1, "{properties:?}");
         assert!(properties.contains_key("fresh"));
+    }
+
+    #[test]
+    fn editing_the_watchlist_takes_names_never_ids() {
+        // The one field is a list of words. There is nowhere for an invented id to go.
+        for name in [ADD, REMOVE] {
+            let spec = specs().into_iter().find(|s| s.name == name).unwrap();
+            let properties = spec.parameters["properties"].as_object().unwrap();
+            assert_eq!(properties.len(), 1, "{name}: {properties:?}");
+            assert_eq!(properties["names"]["type"], "array", "{name}");
+        }
     }
 
     #[test]

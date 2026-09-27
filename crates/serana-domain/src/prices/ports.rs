@@ -9,6 +9,7 @@ use crate::reminder::UserId;
 
 use super::digest::Digest;
 use super::quote::{AssetId, Quote, Snapshot};
+use super::search::AssetMatch;
 
 /// Why prices could not be read.
 ///
@@ -36,6 +37,20 @@ pub trait PriceSource: Send + Sync {
     fn name(&self) -> &str;
 
     async fn quotes(&self, assets: &[AssetId]) -> Result<Vec<Quote>, PriceError>;
+
+    /// Assets whose name or ticker matches `query`, in the source's own order of relevance.
+    ///
+    /// A default rather than a second port: finding an asset by name is something a source
+    /// either can or cannot do, and a separate trait would thread a fourth type parameter
+    /// through every service and alias above this for the sake of one method. A source that
+    /// cannot search says so, and [`PriceSource`] composites ask the next one.
+    async fn search(&self, query: &str) -> Result<Vec<AssetMatch>, PriceError> {
+        let _ = query;
+        Err(PriceError::new(format!(
+            "{} cannot search for assets",
+            self.name()
+        )))
+    }
 }
 
 /// Persistence for digests.
@@ -83,6 +98,10 @@ impl<T: PriceSource + ?Sized> PriceSource for Arc<T> {
 
     async fn quotes(&self, assets: &[AssetId]) -> Result<Vec<Quote>, PriceError> {
         (**self).quotes(assets).await
+    }
+
+    async fn search(&self, query: &str) -> Result<Vec<AssetMatch>, PriceError> {
+        (**self).search(query).await
     }
 }
 

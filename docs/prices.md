@@ -30,6 +30,30 @@ It is created the first time the person uses `/prices`, never at startup. A dail
 nobody asked for is the one thing an unprompted push must not be. The prompt's context line
 reads the stored digest *without* creating one, so merely asking a question does not start it.
 
+## Editing the watchlist
+
+`/prices add 1inch token price` and `/prices remove 1inch` edit the digest's own list.
+`SERANA_PRICE_ASSETS` only seeds a new digest; after that the stored list is authoritative.
+
+The model never supplies an id. It passes the names as said, and `PriceService::add` looks
+each one up with the source's search (`PriceSource::search`, a default method — CoinGecko
+implements it, DefiLlama does not, and `Chain` asks the first that can). Two domain rules
+turn the answer into one asset:
+
+- `search_terms` drops filler first — CoinGecko's search finds nothing for "1inch token".
+- `best_match` prefers an exact ticker, then exact name or id, then the source's first
+  result; within each, the best market-cap rank wins. A ticker is not unique: searching
+  "cow" also returns `MOO`, `GCOW` and an unranked `COW` lookalike, and the one meant is
+  the ranked one.
+
+The reply names what was found ("UNI (Uniswap)") so a wrong resolution is visible at once.
+All lookups run before anything is written, so a rate limit mid-list changes nothing.
+Removing matches by id or by the ticker last shown, and refuses to empty the list — a digest
+of nothing would retry every tick forever; pausing is what someone wanting none of it means.
+
+Adding drops the cache (it no longer covers what is watched) and reads the market so the
+reply shows the new asset priced. Removing keeps the cache, less the removed rows.
+
 ## Cache
 
 The scheduled run reads the market, sends, and stores the snapshot. `/prices` answers from

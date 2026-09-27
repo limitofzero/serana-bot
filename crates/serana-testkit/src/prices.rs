@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use serana_domain::NotifyError;
 use serana_domain::StorageError;
 use serana_domain::prices::{
-    AssetId, Digest, DigestNotifier, DigestRepository, PriceError, PriceSource, Quote, Snapshot,
+    AssetId, AssetMatch, Digest, DigestNotifier, DigestRepository, PriceError, PriceSource, Quote,
+    Snapshot,
 };
 use serana_domain::reminder::UserId;
 
@@ -17,6 +18,8 @@ use serana_domain::reminder::UserId;
 #[derive(Debug, Default)]
 pub struct StubPrices {
     prices: Mutex<Vec<(AssetId, f64)>>,
+    /// What a search can turn up, in the order a source would rank it.
+    listed: Mutex<Vec<AssetMatch>>,
     calls: Mutex<usize>,
     broken: Option<PriceError>,
 }
@@ -42,6 +45,17 @@ impl StubPrices {
         self
     }
 
+    /// Make an asset findable by search, and priced.
+    pub fn listed(self, id: &str, name: &str, symbol: &str, rank: Option<u32>, usd: f64) -> Self {
+        self.listed.lock().expect("not poisoned").push(AssetMatch {
+            id: AssetId::new(id),
+            name: name.into(),
+            symbol: symbol.into(),
+            rank,
+        });
+        self.priced(id, usd)
+    }
+
     /// How many times prices were read.
     pub fn calls(&self) -> usize {
         *self.calls.lock().expect("not poisoned")
@@ -60,17 +74,44 @@ impl PriceSource for StubPrices {
             return Err(error.clone());
         }
         let prices = self.prices.lock().expect("not poisoned");
+        let listed = self.listed.lock().expect("not poisoned");
         Ok(assets
             .iter()
             .filter_map(|asset| {
                 let (_, usd) = prices.iter().find(|(known, _)| known == asset)?;
+                // The ticker a real source would give, when the asset was listed with one.
+                let symbol = listed.iter().find(|entry| &entry.id == asset).map_or_else(
+                    || asset.as_str().to_uppercase(),
+                    |entry| entry.symbol.clone(),
+                );
                 Some(Quote {
                     asset: asset.clone(),
-                    symbol: asset.as_str().to_uppercase(),
+                    symbol,
                     usd: *usd,
                     change_24h: Some(1.5),
                 })
             })
+            .collect())
+    }
+
+    /// Anything whose id, name or ticker contains the query, the way a real search does —
+    /// which is what makes choosing among the results worth testing.
+    async fn search(&self, query: &str) -> Result<Vec<AssetMatch>, PriceError> {
+        if let Some(error) = &self.broken {
+            return Err(error.clone());
+        }
+        let wanted = query.trim().to_lowercase();
+        Ok(self
+            .listed
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|asset| {
+                asset.id.as_str().to_lowercase().contains(&wanted)
+                    || asset.name.to_lowercase().contains(&wanted)
+                    || asset.symbol.to_lowercase().contains(&wanted)
+            })
+            .cloned()
             .collect())
     }
 }

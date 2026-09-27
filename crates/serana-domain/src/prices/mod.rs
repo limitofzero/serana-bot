@@ -7,10 +7,12 @@
 mod digest;
 mod ports;
 mod quote;
+mod search;
 
 pub use digest::Digest;
 pub use ports::{DigestNotifier, DigestRepository, PriceError, PriceSource};
 pub use quote::{AssetId, Quote, Snapshot};
+pub use search::{AssetMatch, best_match, search_terms};
 
 #[cfg(test)]
 mod tests;

@@ -12,7 +12,7 @@ mod tools;
 pub use capability::Watching;
 pub use config::{DEFAULT_CACHE_TTL, PriceConfig};
 pub use error::PriceTurnError;
-pub use outcome::PriceOutcome;
+pub use outcome::{PriceOutcome, WatchlistEdit};
 pub use scheduler::{DigestReport, DigestScheduler};
 pub use service::PriceService;
 

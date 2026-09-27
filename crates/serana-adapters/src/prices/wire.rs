@@ -20,6 +20,21 @@ pub(super) struct MarketRow {
     pub price_change_percentage_24h: Option<f64>,
 }
 
+/// CoinGecko's `search`: coins, alongside exchanges and categories we do not want.
+#[derive(Debug, Deserialize)]
+pub(super) struct SearchResults {
+    #[serde(default)]
+    pub coins: Vec<SearchCoin>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SearchCoin {
+    pub id: String,
+    pub name: String,
+    pub symbol: String,
+    pub market_cap_rank: Option<u32>,
+}
+
 /// DefiLlama's `prices/current`: an object keyed by `source:id`.
 #[derive(Debug, Deserialize)]
 pub(super) struct LlamaCoins {

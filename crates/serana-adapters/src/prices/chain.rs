@@ -8,7 +8,7 @@
 //! This is itself a [`PriceSource`], so nothing above it knows there is more than one.
 
 use async_trait::async_trait;
-use serana_domain::prices::{AssetId, PriceError, PriceSource, Quote};
+use serana_domain::prices::{AssetId, AssetMatch, PriceError, PriceSource, Quote};
 
 /// Sources in preference order.
 pub struct Chain {
@@ -67,6 +67,20 @@ impl PriceSource for Chain {
             }
         }
 
+        Err(PriceError::new(failures.join("; ")))
+    }
+
+    /// The first source that can search, and does. DefiLlama cannot, so in practice this is
+    /// CoinGecko — and when CoinGecko is rate limited, adding an asset waits a minute rather
+    /// than guessing at an id.
+    async fn search(&self, query: &str) -> Result<Vec<AssetMatch>, PriceError> {
+        let mut failures: Vec<String> = Vec::new();
+        for source in &self.sources {
+            match source.search(query).await {
+                Ok(found) => return Ok(found),
+                Err(error) => failures.push(format!("{}: {error}", source.name())),
+            }
+        }
         Err(PriceError::new(failures.join("; ")))
     }
 }

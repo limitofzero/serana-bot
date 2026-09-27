@@ -15,7 +15,7 @@ pub use calendar::{CalendarChat, CalendarOutcome, CalendarService, CalendarTurnE
 pub use chat::{Capability, Chat, ChatConfig, DEFAULT_COMPACT_ABOVE_TOKENS, TurnError};
 pub use prices::{
     DigestReport, DigestScheduler, PriceChat, PriceConfig, PriceOutcome, PriceService,
-    PriceTurnError, Watching,
+    PriceTurnError, Watching, WatchlistEdit,
 };
 pub use reminders::{
     ChatService, ReminderError, ReminderOutcome, ReminderService, SchedulerService, TickReport,
