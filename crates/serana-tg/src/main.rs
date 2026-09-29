@@ -12,7 +12,9 @@ use serana_tg::TelegramCommand;
 use serana_tg::admission::{Admission, admit};
 use serana_tg::config::TelegramConfig;
 use serana_tg::notifier::TelegramNotifier;
+use serana_tg::quote::quotable;
 use teloxide::prelude::*;
+use teloxide::types::{Me, User};
 use teloxide::utils::command::BotCommands;
 
 struct AppState {
@@ -103,10 +105,13 @@ async fn main() -> anyhow::Result<()> {
 
 /// Who sent this. Channel posts and similar have none, and there is nobody to answer.
 fn sender(message: &Message) -> Option<UserId> {
-    message
-        .from
-        .as_ref()
-        .map(|user| UserId::new(user.id.0 as i64))
+    message.from.as_ref().map(user_id)
+}
+
+/// Convert a Telegram user into our own [`UserId`], the one conversion every comparison
+/// against it goes through — so an admission check and an author check always agree.
+fn user_id(user: &User) -> UserId {
+    UserId::new(user.id.0 as i64)
 }
 
 /// Send `body` back, logging rather than failing the update if it cannot be delivered.
@@ -141,7 +146,15 @@ async fn admitted(bot: &Bot, message: &Message, state: &AppState) -> Option<User
 }
 
 /// A message that is not a command: treated as a continuation of the conversation.
-async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyhow::Result<()> {
+///
+/// `me` is injected by teloxide's dispatcher from `getMe`, the same way `Message` and `Bot`
+/// are: it is how this function learns the bot's own user id without an extra API call.
+async fn dispatch_text(
+    bot: Bot,
+    message: Message,
+    me: Me,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
     let Some(text) = message
         .text()
         .map(str::trim)
@@ -174,10 +187,17 @@ async fn dispatch_text(bot: Bot, message: Message, state: Arc<AppState>) -> anyh
     // often a delivery the scheduler pushed, which never entered the conversation, so this
     // is the only way the assistant can know what "this one" refers to — and it is aimed at
     // the conversation that message came from, which need not be the last one they used.
-    let command = match message
-        .reply_to_message()
-        .and_then(|replied| replied.text())
-    {
+    //
+    // But it is only quoted when the bot itself sent it: a private chat still lets someone
+    // reply to, or forward in, a third party's message, and quoting that back as
+    // "[replying to this message of yours: …]" would tell the model it wrote text it never
+    // saw — including a planted reminder id marker or instructions framed as its own.
+    let replied = message.reply_to_message();
+    let replied_author = replied
+        .and_then(|replied| replied.from.as_ref())
+        .map(user_id);
+    let replied_text = replied.and_then(|replied| replied.text());
+    let command = match quotable(replied_author, replied_text, user_id(&me.user)) {
         Some(quoted) => Command::replying(text::topic_of(quoted).unwrap_or(last), quoted, &text),
         None => Command::bare(last, &text),
     };

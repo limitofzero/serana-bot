@@ -33,19 +33,31 @@ impl TelegramConfig {
 /// with a leaked bot token and an open allowlist would take instructions, and spend the
 /// owner's tokens, for anyone who found it. Failing closed makes the misconfiguration
 /// obvious instead of expensive.
+///
+/// Entries must be positive: the allowlist is only ever checked against `message.from`,
+/// which is a user id and always positive, and the bot has refused every non-private chat
+/// since admission was introduced. A zero or negative entry — a group or channel id — can
+/// never match, so accepting it silently would leave an owner who added a group expecting
+/// the bot to serve it staring at silence with nothing telling them why.
 pub fn parse_allowed_users(raw: &str) -> anyhow::Result<HashSet<UserId>> {
     raw.split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(|entry| {
-            entry
+            let id = entry
                 .parse::<i64>()
-                .map(UserId::new)
                 // Naming the variable is the whole diagnosis: the value alone leaves
                 // someone reading a crash loop to guess which line of `.env` is wrong.
                 .with_context(|| {
                     format!("SERANA_ALLOWED_USER_IDS: {entry:?} is not a Telegram user id")
-                })
+                })?;
+            anyhow::ensure!(
+                id > 0,
+                "SERANA_ALLOWED_USER_IDS: {entry:?} looks like a group or channel chat id, \
+                 not a user id — the bot only answers commands in a private chat, so it can \
+                 never match one"
+            );
+            Ok(UserId::new(id))
         })
         .collect()
 }
@@ -102,9 +114,15 @@ mod tests {
     }
 
     #[test]
-    fn negative_ids_are_accepted_because_group_chats_have_them() {
-        let allowed = parse_allowed_users("-1001234567890").unwrap();
-        assert!(allowed.contains(&UserId::new(-1_001_234_567_890)));
+    fn negative_or_zero_ids_are_refused_as_chat_ids_not_user_ids() {
+        // The allowlist is only ever checked against `message.from`, a user id, and the
+        // bot refuses every non-private chat outright — so a group or channel id here can
+        // never match anything, and an owner who added one deserves an error, not silence.
+        for raw in ["-1001234567890", "0"] {
+            let error = parse_allowed_users(raw).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("SERANA_ALLOWED_USER_IDS"), "{rendered}");
+        }
     }
 
     #[test]

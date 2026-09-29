@@ -7,5 +7,6 @@ pub mod admission;
 pub mod command;
 pub mod config;
 pub mod notifier;
+pub mod quote;
 
 pub use command::TelegramCommand;
